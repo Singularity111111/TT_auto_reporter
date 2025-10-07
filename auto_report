@@ -1,0 +1,154 @@
+import time
+import os
+from datetime import date
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+# ⭐ 新增强大的数据处理库
+import pandas as pd
+
+# ===============================================
+#                 ⭐⭐⭐ 配置区 ⭐⭐⭐
+# ===============================================
+
+# 1. 目标网站后台登录信息
+LOGIN_URL = "https://admin.sgo79z11raz9mx1v.1xspin.games/session/new"
+USERNAME = "touhou01"
+PASSWORD = "518ad6eba0b353e7"
+
+# 2. 数据文件保存的路径
+#    默认会保存在您桌面上的 "1xspin_reports" 文件夹中
+SAVE_PATH = os.path.join(os.path.expanduser('~'), 'Desktop', '1xspin_reports')
+
+
+# ===============================================
+
+def scrape_and_save_table(driver, report_name, save_path):
+    """
+    在当前页面上查找HTML表格，读取其内容，并将其保存为CSV文件。
+    """
+    try:
+        print(f"  🤖 正在页面上查找数据表格...")
+        wait = WebDriverWait(driver, 15)
+        table_element = wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
+
+        html_content = table_element.get_attribute('outerHTML')
+        # 使用 lxml 解析器读取表格
+        df_list = pd.read_html(html_content, flavor='lxml')
+
+        if not df_list:
+            print(f"  [❌ 错误] 在 '{report_name}' 页面上未找到任何表格！")
+            return
+
+        df = df_list[0]
+
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        today_str = date.today().strftime('%Y-%m-%d')
+        filename = f"1xspin_{report_name}_{today_str}.csv"
+        filepath = os.path.join(save_path, filename)
+
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+
+        print(f"  [✅ 成功] 数据已抓取并保存为: {filename}")
+        return True  # 返回成功标志
+
+    except Exception as e:
+        print(f"  [❌ 错误] 在抓取 '{report_name}' 表格时发生错误: {e}")
+        return False  # 返回失败标志
+
+
+# --- 主程序开始 ---
+print("--- 1xspin 后台留存数据爬虫 (v3.3 修复依赖并增加分页处理) ---")
+
+# 配置浏览器选项
+chrome_options = Options()
+chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+chrome_options.add_experimental_option('useAutomationExtension', False)
+chrome_options.add_argument(
+    'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36')
+chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+
+driver = None  # 初始化driver变量
+try:
+    print("\n[初始化] 正在自动检测Chrome版本并下载匹配的驱动...")
+    s = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=s, options=chrome_options)
+    print("[✅ 驱动准备就绪!]")
+
+    wait = WebDriverWait(driver, 20)
+
+    # 1. 登录
+    print(f"\n[步骤 1/3] 正在打开登录页面: {LOGIN_URL}")
+    driver.get(LOGIN_URL)
+
+    print("  > 正在输入账号...")
+    wait.until(EC.presence_of_element_located((By.ID, "email_address"))).send_keys(USERNAME)
+
+    print("  > 正在输入密码...")
+    driver.find_element(By.ID, "password").send_keys(PASSWORD)
+
+    print("  > 正在点击登录按钮...")
+    driver.find_element(By.XPATH, "//button[@type='submit']").click()
+
+    print("  > 等待登录成功...")
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href='/data_report/user_retentions']")))
+    print("[✅ 登录成功!]")
+
+    reports_to_scrape = [
+        {"name": "首充登录留存", "tab_selector": (By.CSS_SELECTOR, "a[href*='user_type=first_login_user']")},
+        {"name": "首充下注留存", "tab_selector": (By.CSS_SELECTOR, "a[href*='user_type=first_play_user']")},
+        {"name": "首充付费留存", "tab_selector": (By.CSS_SELECTOR, "a[href*='user_type=first_pay_user']")}
+    ]
+
+    print(f"\n[步骤 2/3] 准备开始抓取 {len(reports_to_scrape)} 份留存报表...")
+
+    retention_url = "https://admin.sgo79z11raz9mx1v.1xspin.games/data_report/user_retentions"
+    print(f"  > 正在跳转到用户留存主页面...")
+    driver.get(retention_url)
+
+    success_count = 0
+    for report in reports_to_scrape:
+        report_name = report['name']
+        print(f"\n--- 正在处理报表: 《{report_name}》 ---")
+
+        print(f"  > 正在切换到 '{report_name}' 标签页...")
+        wait.until(EC.element_to_be_clickable(report['tab_selector'])).click()
+
+        # ⭐ 新增逻辑：设置每页显示条数为500 ⭐
+        try:
+            print("  > 正在设置每页显示 500 条数据...")
+            # 1. 定位到下拉选择框
+            size_dropdown = Select(wait.until(EC.presence_of_element_located((By.ID, "size"))))
+            # 2. 选择值为 "500" 的选项
+            size_dropdown.select_by_value("500")
+            print("  > 等待页面刷新数据...")
+            time.sleep(5)  # 等待页面重新加载表格
+        except Exception as e:
+            print(f"  [⚠️ 警告] 设置每页显示条数失败: {e}。将尝试抓取当前页面数据。")
+
+        if scrape_and_save_table(driver, report_name, SAVE_PATH):
+            success_count += 1
+
+    print("\n" + "=" * 50)
+    if success_count == len(reports_to_scrape):
+        print("🎉🎉🎉 全部留存报表抓取成功！ 🎉🎉🎉")
+        print(f"文件已全部保存到您桌面上的文件夹中: {SAVE_PATH}")
+    else:
+        print(f"⚠️ 部分报表抓取失败，成功 {success_count} / {len(reports_to_scrape)} 份。请检查上面的错误日志。")
+    print("=" * 50)
+
+except Exception as e:
+    print(f"\n[❌ 严重错误] 脚本在运行中发生意外: {e}")
+    print("请检查您的网络连接或网站是否已更新。")
+
+finally:
+    if driver:
+        driver.quit()
+    print("\n[步骤 3/3] 浏览器已关闭，脚本运行结束。")
+
