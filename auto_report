@@ -1,154 +1,1028 @@
-import time
-import os
-from datetime import date
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-# ⭐ 新增强大的数据处理库
+# -*- coding: utf-8 -*-
+"""
+generate_daily_agent_report.py
+
+将同一目录下的多类 CSV/XLSX（运营/代理/平台/用户日常/留存/首充LTV/成本等）
+按统一口径 清洗→对齐→合并→计算，生成“每日总代数据”（渠道/总代日级，主键：[日期, 盘口, 总代号]）。
+
+使用：
+  python generate_daily_agent_report.py --input . --output 每日总代数据_自动生成.xlsx
+
+
+- 与目标表对齐的 53 列已经在 FINAL_COLUMNS 中锁定顺序与中文列名。
+- “总代号”来自【运营数据】里“总代名称/渠道/channel/agent_name”字段末尾括号的纯数字（支持半角/全角），
+  其它来源若无 ID，按“清洗后的总代名称”映射回填。
+- 平台/盘口级指标（LTV/留存/成本等）按 [日期, 盘口] 广播到所有渠道行。
+- 无对应来源时，数值默认 0（个别字段留空），以保证 53 列完整输出。
+"""
+
+import argparse, os, sys, re, glob
+from datetime import datetime
+from hashlib import md5
 import pandas as pd
 
-# ===============================================
-#                 ⭐⭐⭐ 配置区 ⭐⭐⭐
-# ===============================================
+# 设置输出编码为 UTF-8（解决 Windows 控制台中文显示问题）
+if sys.platform == 'win32':
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
-# 1. 目标网站后台登录信息
-LOGIN_URL = "https://admin.sgo79z11raz9mx1v.1xspin.games/session/new"
-USERNAME = "touhou01"
-PASSWORD = "518ad6eba0b353e7"
+# ----------------------------- 可配置区域（必要时补充） -----------------------------
 
-# 2. 数据文件保存的路径
-#    默认会保存在您桌面上的 "1xspin_reports" 文件夹中
-SAVE_PATH = os.path.join(os.path.expanduser('~'), 'Desktop', '1xspin_reports')
+# 列名别名映射（各来源 → 标准字段名）
+ALIASES = {
+    "date":        ["日期","时间","date","统计日期","dt"],
+    "channel":     ["渠道名称","总代名称","渠道","channel","agent_name","渠道名","agent","channel_name","代理名称"],
+    "agent_id":    ["代理ID","agent_id","AgentID","总代ID"],  # v2.1: 新增代理ID列识别
+    "platform":    ["盘口","平台","platform","game_platform"],
+    # 指标类
+    "register":    ["注册人数","新增注册","注册"],
+    "active":      ["活跃人数","活跃"],
+    "pay_users":   ["充值人数","付费人数"],
+    "pay_amount":  ["充值金额","付费金额","金额","总充值"],
+    "firstpay_u":  ["首充人数","首充人数（当日）"],
+    "firstpay_a":  ["首充金额","首充金额（当日）","首充付费金额","当日首充金额"],
+    "pay_active_u":["活跃充值人数"],
+    "impr":        ["展示","impressions"],
+    "click":       ["点击","clicks"],
+    "spend":       ["消耗","cost","花费","spent"],
+    "withdraw":    ["提现金额","withdrew","withdrawal"],
+    # 运营类（若有）
+    "bet_amt":     ["投注金额","总投注额"],
+    "win_amt":     ["中奖金额","总中奖额"],
+    "bet_cnt":     ["投注次数"],
+    "bet_users":   ["投注人数"],
+    # LTV & Retention（不同来源列名可能不同，这里只示意；脚本会按常见命名抓取）
+    "ltv_d1":      ["LTV(D1)","ltv_d1","ltv1"],
+    "ltv_d3":      ["LTV(D3)","ltv_d3","ltv3"],
+    "ltv_d7":      ["LTV(D7)","ltv_d7","ltv7"],
+    "ltv_d14":     ["LTV(D14)","ltv_d14","ltv14"],
+    "ltv_d30":     ["LTV(D30)","ltv_d30","ltv30"],
+    # 首充LTV（FPLTV）
+    "fpltv_d1":    ["FPLTV_D1","首充当日LTV","fpltv_d1"],
+    "fpltv_d2":    ["FPLTV_D2","fpltv_d2"],
+    "fpltv_d3":    ["FPLTV_D3","fpltv_d3"],
+    "fpltv_d7":    ["FPLTV_D7","fpltv_d7"],
+    "fpltv_d15":   ["FPLTV_D15","fpltv_d15"],
+    "fpltv_d30":   ["FPLTV_D30","fpltv_d30"],
+    # 留存（示例：D1/D3/D7/D14/D30；不同来源文件名区分：first_login / register / first_pay）
+    "ret_d1":      ["D1","留存率(D1)","ret_d1"],
+    "ret_d3":      ["D3","留存率(D3)","ret_d3"],
+    "ret_d7":      ["D7","留存率(D7)","ret_d7"],
+    "ret_d14":     ["D14","留存率(D14)","ret_d14"],
+    "ret_d30":     ["D30","留存率(D30)","ret_d30"],
+}
 
+# 代码映射（根据你们的规则图可自行补全）
+TYPE_MAP   = {"111":"投放","222":"网红","333":"群发(短信等)","444":"外部合作","555":"任务量(变现)","666":"私域","OP":"运营"}
+MEDIA_MAP  = {"KKK":"FB","SSS":"快手","TK":"抖音/TikTok","TTT":"Twitter","GGG":"谷歌","III":"INS","QQQ":"其他","WS":"WS","ZZZ":"群发","RRR":"bigo"}
+METHOD_MAP = {"AAA":"H5","BBB":"PWA","CCC":"马甲包","DDD":"谷歌包","EEE":"APK","PPP":"iOS苹果包","FFF":"小米包"}
 
-# ===============================================
+# 部门→盘口（你们的映射，按需补全；如果平台报表有 platform 字段就优先用平台字段）
+DEPT_TO_PLATFORM = {
+    # 例： "A8":"A8",
+}
 
-def scrape_and_save_table(driver, report_name, save_path):
-    """
-    在当前页面上查找HTML表格，读取其内容，并将其保存为CSV文件。
-    """
-    try:
-        print(f"  🤖 正在页面上查找数据表格...")
-        wait = WebDriverWait(driver, 15)
-        table_element = wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
+# 与目标表完全一致的 53 列顺序（不要改中文）
+FINAL_COLUMNS = [
+    "产品","盘口","日期","总代号","总代名称","推广部门","推广方式","消耗","充提差","展示","点击","千展成本crm","点击率",
+    "注册成本","首充成本","一级首充成本","注册人数","首充人数","一级首充人数","首充转化率","首充arppu","首充roas",
+    "首充当日ltv","首充当日roi","首充充提差比","当日首充金额","首充当日充提差",
+    "首充次日复登率_偏移","首充三日复登率_偏移","首充七日复登率_偏移","首充十五日复登率_偏移","首充三十日复登率_偏移",
+    "首充次日复投率_偏移","首充三日复投率_偏移","首充七日复投率_偏移","首充十五日复投率_偏移","首充三十日复投率_偏移",
+    "首充次日复充率_偏移","首充三日复充率_偏移","首充七日复充率_偏移","首充十五日复充率_偏移","首充三十日复充率_偏移",
+    "首充两日ltv_偏移","首充三日ltv_偏移","首充七日ltv_偏移","首充十五日ltv_偏移","首充三十日ltv_偏移",
+    "累计roas","自然月消耗","非一级首充人数/首充人数","非一级首充人数/充值人数","充值金额","充值人数"
+]
 
-        html_content = table_element.get_attribute('outerHTML')
-        # 使用 lxml 解析器读取表格
-        df_list = pd.read_html(html_content, flavor='lxml')
+# ----------------------------- 工具函数 -----------------------------
 
-        if not df_list:
-            print(f"  [❌ 错误] 在 '{report_name}' 页面上未找到任何表格！")
-            return
-
-        df = df_list[0]
-
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-
-        today_str = date.today().strftime('%Y-%m-%d')
-        filename = f"1xspin_{report_name}_{today_str}.csv"
-        filepath = os.path.join(save_path, filename)
-
-        df.to_csv(filepath, index=False, encoding='utf-8-sig')
-
-        print(f"  [✅ 成功] 数据已抓取并保存为: {filename}")
-        return True  # 返回成功标志
-
-    except Exception as e:
-        print(f"  [❌ 错误] 在抓取 '{report_name}' 表格时发生错误: {e}")
-        return False  # 返回失败标志
-
-
-# --- 主程序开始 ---
-print("--- 1xspin 后台留存数据爬虫 (v3.3 修复依赖并增加分页处理) ---")
-
-# 配置浏览器选项
-chrome_options = Options()
-chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-chrome_options.add_experimental_option('useAutomationExtension', False)
-chrome_options.add_argument(
-    'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36')
-chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-
-driver = None  # 初始化driver变量
-try:
-    print("\n[初始化] 正在自动检测Chrome版本并下载匹配的驱动...")
-    s = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=s, options=chrome_options)
-    print("[✅ 驱动准备就绪!]")
-
-    wait = WebDriverWait(driver, 20)
-
-    # 1. 登录
-    print(f"\n[步骤 1/3] 正在打开登录页面: {LOGIN_URL}")
-    driver.get(LOGIN_URL)
-
-    print("  > 正在输入账号...")
-    wait.until(EC.presence_of_element_located((By.ID, "email_address"))).send_keys(USERNAME)
-
-    print("  > 正在输入密码...")
-    driver.find_element(By.ID, "password").send_keys(PASSWORD)
-
-    print("  > 正在点击登录按钮...")
-    driver.find_element(By.XPATH, "//button[@type='submit']").click()
-
-    print("  > 等待登录成功...")
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href='/data_report/user_retentions']")))
-    print("[✅ 登录成功!]")
-
-    reports_to_scrape = [
-        {"name": "首充登录留存", "tab_selector": (By.CSS_SELECTOR, "a[href*='user_type=first_login_user']")},
-        {"name": "首充下注留存", "tab_selector": (By.CSS_SELECTOR, "a[href*='user_type=first_play_user']")},
-        {"name": "首充付费留存", "tab_selector": (By.CSS_SELECTOR, "a[href*='user_type=first_pay_user']")}
-    ]
-
-    print(f"\n[步骤 2/3] 准备开始抓取 {len(reports_to_scrape)} 份留存报表...")
-
-    retention_url = "https://admin.sgo79z11raz9mx1v.1xspin.games/data_report/user_retentions"
-    print(f"  > 正在跳转到用户留存主页面...")
-    driver.get(retention_url)
-
-    success_count = 0
-    for report in reports_to_scrape:
-        report_name = report['name']
-        print(f"\n--- 正在处理报表: 《{report_name}》 ---")
-
-        print(f"  > 正在切换到 '{report_name}' 标签页...")
-        wait.until(EC.element_to_be_clickable(report['tab_selector'])).click()
-
-        # ⭐ 新增逻辑：设置每页显示条数为500 ⭐
+def read_any_csv(path):
+    """自动识别分隔符/编码读取 CSV。"""
+    for enc in ("utf-8", "utf-8-sig", "gbk"):
         try:
-            print("  > 正在设置每页显示 500 条数据...")
-            # 1. 定位到下拉选择框
-            size_dropdown = Select(wait.until(EC.presence_of_element_located((By.ID, "size"))))
-            # 2. 选择值为 "500" 的选项
-            size_dropdown.select_by_value("500")
-            print("  > 等待页面刷新数据...")
-            time.sleep(5)  # 等待页面重新加载表格
-        except Exception as e:
-            print(f"  [⚠️ 警告] 设置每页显示条数失败: {e}。将尝试抓取当前页面数据。")
+            # sep=None + engine='python' 可自动推断分隔符
+            df = pd.read_csv(path, sep=None, engine="python", dtype=str)
+            return df
+        except Exception:
+            try:
+                df = pd.read_csv(path, sep=None, engine="python", dtype=str, encoding=enc)
+                return df
+            except Exception:
+                continue
+    raise RuntimeError(f"无法读取CSV: {path}")
 
-        if scrape_and_save_table(driver, report_name, SAVE_PATH):
-            success_count += 1
+def read_any_table(path):
+    """根据扩展名自动读取 CSV 或 Excel（首个sheet），统一为 DataFrame[str]。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".csv", ".txt", ".tsv"]:
+        return read_any_csv(path)
+    # Excel
+    try:
+        df = pd.read_excel(path, dtype=str)
+        return df
+    except Exception:
+        # 再试一次不同引擎
+        df = pd.read_excel(path, dtype=str, engine="openpyxl")
+        return df
 
-    print("\n" + "=" * 50)
-    if success_count == len(reports_to_scrape):
-        print("🎉🎉🎉 全部留存报表抓取成功！ 🎉🎉🎉")
-        print(f"文件已全部保存到您桌面上的文件夹中: {SAVE_PATH}")
+def list_input_files(root_dir):
+    """递归扫描目录下所有CSV/Excel文件（v2.1：过滤临时文件、无关目录、历史输出）"""
+    files = []
+    
+    print(f"[扫描] 正在扫描目录: {root_dir}")
+    
+    # v2.1: 跳过的目录列表（避免扫描Chrome和cookies等无关目录）
+    skip_dirs = {
+        'chrome_user_data',  # Chrome浏览器数据（3000+文件）
+        'cookies',           # Cookie文件
+        '__pycache__',       # Python缓存
+        '.git',              # Git版本控制
+        'node_modules'       # Node依赖（如果有）
+    }
+    
+    # v2.1: 跳过的文件名模式（历史输出文件和配置文件）
+    skip_file_patterns = [
+        'sites.csv',         # 配置文件，不是数据源！
+        '每日总代数据_修复版',
+        '每日总代数据_完整版', 
+        '每日总代数据_最新',
+        '每日总代数据_最终修复版',
+        '每日总代数据_调试版',
+        '每日总代数据_聚合修复版',
+        '每日总代数据明细表',
+        '每日总代数据_20',  # 匹配 "每日总代数据_20251013 (2).xlsx" 等
+        # 乱码版本的文件名
+        'æ¯æ—¥æ€»ä»£æ•°æ®',
+    ]
+    
+    scanned_count = 0
+    skipped_count = 0
+    
+    for r, dirs, fs in os.walk(root_dir):
+        # v2.1: 过滤掉不需要扫描的子目录（直接修改dirs列表）
+        original_dirs = len(dirs)
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        skipped_dirs = original_dirs - len(dirs)
+        
+        for f in fs:
+            scanned_count += 1
+            
+            # 跳过 Excel 临时文件（以 ~$ 开头）
+            if f.startswith('~$'):
+                skipped_count += 1
+                continue
+                
+            # 跳过隐藏文件（以 . 开头）
+            if f.startswith('.'):
+                skipped_count += 1
+                continue
+            
+            # 跳过历史输出文件和配置文件（根据文件名模式）
+            # 但保留 "每日总代数据_自动生成.xlsx"（当前输出文件，如果需要读取）
+            should_skip = False
+            if f != '每日总代数据_自动生成.xlsx':  # 保留当前输出文件
+                for pattern in skip_file_patterns:
+                    if pattern in f:
+                        should_skip = True
+                        skipped_count += 1
+                        break
+            
+            if should_skip:
+                continue
+            
+            # 跳过根目录下带序号后缀的重复文件，如 "xxx (2).xlsx"
+            # 但保留downloads目录下的文件（那些是新下载的，可能带(1)）
+            if r == os.path.abspath(root_dir):  # 只检查根目录
+                if re.search(r'\s*\(\d+\)\.(csv|xlsx|xls)$', f, re.IGNORECASE):
+                    skipped_count += 1
+                    continue
+            
+            # 只收集 CSV/Excel 文件
+            if f.lower().endswith((".csv", ".xlsx", ".xls")):
+                files.append(os.path.join(r, f))
+    
+    print(f"[扫描] 完成！扫描了 {scanned_count} 个文件，跳过 {skipped_count} 个，找到 {len(files)} 个数据文件")
+    return files
+
+def to_half_width(s):
+    if not isinstance(s, str):
+        s = "" if pd.isna(s) else str(s)
+    return "".join(chr(ord(c)-0xFEE0) if "０" <= c <= "９" else c for c in s)
+
+def normalize_date(v):
+    if pd.isna(v) or str(v).strip()=="":
+        return None
+    s = to_half_width(str(v)).strip()
+    # 去掉“数据汇总”
+    if "数据汇总" in s:
+        return None
+    d = pd.to_datetime(s, errors="coerce")
+    if pd.isna(d):
+        return None
+    return d.normalize().strftime("%Y-%m-%d")
+
+TAIL_PATTERNS = [re.compile(r"\((\d+)\)\s*$"), re.compile(r"（(\d+)）\s*$")]
+
+def extract_agent_id_from_tail(name):
+    if not isinstance(name, str):
+        return None
+    s = to_half_width(name).strip()
+    for pat in TAIL_PATTERNS:
+        m = pat.search(s)
+        if m:
+            return int(m.group(1))
+    return None
+
+def strip_tail_parenthesis(name):
+    if not isinstance(name, str):
+        return ""
+    s = to_half_width(name).strip()
+    for pat in TAIL_PATTERNS:
+        s = pat.sub("", s).strip()
+    return s
+
+def stable_agent_id(name):
+    """为没有尾括号ID的名称生成一个稳定的正整数ID（用于主键/聚合）"""
+    if not isinstance(name, str) or not name:
+        return None
+    # 用md5前8位转为正整数，确保同名稳定
+    return int(md5(name.encode("utf-8")).hexdigest()[:8], 16)
+
+def pick_col(df, alias_list):
+    for col in alias_list:
+        if col in df.columns:
+            return col
+    # 不区分大小写再试一次
+    lower_map = {c.lower(): c for c in df.columns}
+    for col in alias_list:
+        lc = col.lower()
+        if lc in lower_map:
+            return lower_map[lc]
+    return None
+
+def parse_channel_clean(clean_name):
+    # 命名格式：盘口_部门_类型码_媒介码_方式码_小组
+    # 增强分隔符兼容：支持 -, 空格, 多下划线等
+    s = to_half_width(str(clean_name)).strip()
+    s = re.sub(r"[\-\s]+", "_", s)  # 横杠和空格转下划线
+    s = re.sub(r"_+", "_", s).strip("_")  # 多下划线合并
+    parts = s.split("_")
+    
+    platform    = parts[0] if len(parts)>0 else ""   # 第1段是"盘口"
+    dept        = parts[1] if len(parts)>1 else ""
+    type_code   = parts[2] if len(parts)>2 else ""
+    media_code  = parts[3] if len(parts)>3 else ""
+    method_code = parts[4] if len(parts)>4 else ""
+    group       = parts[5] if len(parts)>5 else ""
+    
+    return {
+        "产品": "TT产品",                      # 产品固定为"TT产品"
+        "盘口_token": platform,               # 暂存：后面赋到"盘口"列
+        "推广部门": dept,
+        "推广方式": METHOD_MAP.get(method_code, method_code),
+        "type_code": type_code,
+        "type_name": TYPE_MAP.get(type_code, type_code),
+        "media_code": media_code,
+        "media_name": MEDIA_MAP.get(media_code, media_code),
+        "method_code": method_code,
+        "group_name": group
+    }
+
+def is_primary_channel(clean_name):
+    """
+    判定“一级”渠道（用于：一级首充人数/成本）。默认：返回 False。
+    你可以根据业务把规则写在这里，例如：
+      - 指定部门=AX 为一级
+      - 或 指定媒介/方式为一级
+    """
+    return False
+
+# ----------------------------- 文件分类 -----------------------------
+
+def classify_file(path):
+    """根据文件名关键字分类来源类型。"""
+    name = os.path.basename(path).lower()
+    if "operation_export" in name:
+        return "ops"
+    if "agent_report" in name or "代理报表" in name:
+        return "agent"
+    if "platform_report" in name:
+        return "platform"
+    if "user_daily_export" in name:
+        return "daily"
+    if "first_paid_ltv" in name or "ltv" in name:
+        return "fpltv"
+    # v2.1 新增：支持新的文件命名格式
+    if "user_retention_first_login" in name or "首充用户登录留存" in name or "登录留存" in name:
+        return "ret_login"
+    if "user_retention_register_user" in name or "注册留存" in name:
+        return "ret_register"
+    if "user_retention_first_pay" in name or "首充用户付费留存" in name or "付费留存" in name:
+        return "ret_fpay"
+    # v2.1 新增：首充用户下注留存（新类型）
+    if "user_retention_first_play" in name or "首充用户下注留存" in name or "下注留存" in name:
+        return "ret_play"
+    if "阈值营收表" in name or "阈值" in name or "cost" in name or "ads" in name:
+        return "cost"
+    return "unknown"
+
+
+def classify_file_smart(path):
+    """
+    增强版文件分类：先按文件名，再按内容识别
+    适用于爬虫下载的文件（文件名不包含关键字）
+    """
+    # 1. 先用原有的文件名规则
+    typ = classify_file(path)
+    if typ != "unknown":
+        return typ
+    
+    # 2. 如果文件名规则失败，读取文件内容判断
+    try:
+        df = read_any_table(path)
+        if df.empty:
+            return "unknown"
+        
+        # 转换列名为字符串便于匹配
+        cols_str = " ".join([str(c) for c in df.columns])
+        
+        # 判断规则：
+        # 代理报表：有渠道列 + (注册|活跃|充值)相关指标
+        has_channel = any(keyword in cols_str for keyword in ["渠道", "总代", "代理", "agent", "channel", "总代名称"])
+        has_register = any(keyword in cols_str for keyword in ["注册", "register", "新增注册"])
+        has_active = any(keyword in cols_str for keyword in ["活跃", "active"])
+        has_pay = any(keyword in cols_str for keyword in ["充值", "付费", "pay", "充值人数", "充值金额"])
+        
+        if has_channel and (has_register or has_active or has_pay):
+            return "agent"
+        
+        # 首充LTV：包含 FPLTV 或 首充LTV 相关列
+        if any(keyword in cols_str for keyword in ["FPLTV", "首充LTV", "首充ltv"]):
+            return "fpltv"
+        
+        # 平台LTV：包含 ltv_d 系列
+        if any(keyword in cols_str for keyword in ["ltv_d1", "ltv_d3", "ltv_d7", "LTV(D"]):
+            return "platform"
+        
+        # 留存：包含 D1/D3/D7/D14/D30 留存
+        if any(keyword in cols_str for keyword in ["留存", "retention", "D1", "D3", "D7", "D14", "D30"]):
+            # v2.1 优化：更精确的留存类型识别
+            # 优先匹配更具体的类型，避免"首充"关键字导致误判
+            if "下注" in cols_str or "投注" in cols_str or "first_play" in cols_str or "play" in cols_str:
+                return "ret_play"
+            elif ("首充" in cols_str or "first_pay" in cols_str) and ("付费" in cols_str or "充值" in cols_str):
+                return "ret_fpay"
+            elif "首登" in cols_str or "登录" in cols_str or "first_login" in cols_str or "login" in cols_str:
+                return "ret_login"
+            elif "注册" in cols_str or "register" in cols_str:
+                return "ret_register"
+            else:
+                # 默认归类为注册留存
+                return "ret_register"
+        
+        # 成本/广告：包含消耗/展示/点击
+        if any(keyword in cols_str for keyword in ["消耗", "展示", "点击", "spend", "cost", "impression", "click"]):
+            return "cost"
+        
+        # 日常数据：包含首充人数/首充金额
+        if any(keyword in cols_str for keyword in ["首充人数", "首充金额", "firstpay"]):
+            return "daily"
+        
+    except Exception as e:
+        print(f"  [识别警告] {os.path.basename(path)}: {e}")
+    
+    return "unknown"
+
+# ----------------------------- 读取与标准化 -----------------------------
+
+def std_ops(df):
+    """标准化：运营数据（权威来源：抽取总代号；可带投注/中奖/利润）"""
+    c_date    = pick_col(df, ALIASES["date"])
+    c_channel = pick_col(df, ALIASES["channel"])
+    
+    # 如果没有渠道列，说明是平台级汇总，返回空（稍后会从其他源获取）
+    if c_channel is None:
+        print("  Note: Operation data has no channel column (platform-level aggregate), skipping...")
+        return pd.DataFrame()
+    
+    out = pd.DataFrame()
+    out["日期"] = df[c_date].map(normalize_date)
+    out["总代名称"] = df[c_channel]
+    out["总代名称_清洗"] = out["总代名称"].map(strip_tail_parenthesis)
+    out["总代号"] = out["总代名称"].map(extract_agent_id_from_tail)
+    # 运营指标（若有）
+    c_bet_amt  = pick_col(df, ALIASES["bet_amt"])
+    c_win_amt  = pick_col(df, ALIASES["win_amt"])
+    c_bet_cnt  = pick_col(df, ALIASES["bet_cnt"])
+    c_bet_user = pick_col(df, ALIASES["bet_users"])
+    if c_bet_amt:  out["投注金额"] = pd.to_numeric(df[c_bet_amt], errors="coerce").fillna(0.0)
+    if c_win_amt:  out["中奖金额"] = pd.to_numeric(df[c_win_amt], errors="coerce").fillna(0.0)
+    if c_bet_cnt:  out["投注次数"] = pd.to_numeric(df[c_bet_cnt], errors="coerce").fillna(0.0)
+    if c_bet_user: out["投注人数"] = pd.to_numeric(df[c_bet_user], errors="coerce").fillna(0.0)
+    return out.dropna(subset=["日期","总代名称"])
+
+def std_agent(df, name_id_map):
+    """标准化：代理报表（注册/活跃/充值）"""
+    c_date    = pick_col(df, ALIASES["date"])
+    c_channel = pick_col(df, ALIASES["channel"])
+    
+    # 如果没有渠道列，跳过
+    if c_channel is None:
+        print("  Note: Agent data has no channel column, skipping...")
+        return pd.DataFrame()
+    
+    out = pd.DataFrame()
+    out["日期"] = df[c_date].map(normalize_date)
+    out["总代名称"] = df[c_channel]
+    out["总代名称_清洗"] = out["总代名称"].map(strip_tail_parenthesis)
+    
+    # v2.1: 优先使用"代理ID"列（如果存在）
+    c_agent_id = pick_col(df, ALIASES["agent_id"])
+    if c_agent_id:
+        # 直接使用CSV文件中的代理ID列
+        out["总代号"] = pd.to_numeric(df[c_agent_id], errors="coerce").astype("Int64")
+        print(f"  [代理数据] 使用代理ID列: {c_agent_id}")
+    elif name_id_map:
+        # 使用name_id_map映射
+        out["总代号"] = out["总代名称_清洗"].map(name_id_map).astype("Int64")
     else:
-        print(f"⚠️ 部分报表抓取失败，成功 {success_count} / {len(reports_to_scrape)} 份。请检查上面的错误日志。")
-    print("=" * 50)
+        # 使用stable_id函数生成总代号
+        from hashlib import md5
+        def stable_id_func(name):
+            if pd.isna(name):
+                return pd.NA
+            return int(md5(str(name).encode('utf-8')).hexdigest()[:8], 16)
+        out["总代号"] = out["总代名称_清洗"].map(stable_id_func).astype("Int64")
+    
+    # 基础指标
+    c_reg   = pick_col(df, ALIASES["register"])
+    c_act   = pick_col(df, ALIASES["active"])
+    c_pu    = pick_col(df, ALIASES["pay_users"])
+    c_pa    = pick_col(df, ALIASES["pay_amount"])
+    c_fpu   = pick_col(df, ALIASES["firstpay_u"])
+    c_fpa   = pick_col(df, ALIASES["firstpay_a"])
+    c_wd    = pick_col(df, ALIASES["withdraw"])
+    
+    if c_reg: out["注册人数"] = pd.to_numeric(df[c_reg], errors="coerce").fillna(0).astype("Int64")
+    if c_act: out["活跃人数"] = pd.to_numeric(df[c_act], errors="coerce").fillna(0).astype("Int64")
+    if c_pu:  out["充值人数"] = pd.to_numeric(df[c_pu], errors="coerce").fillna(0).astype("Int64")
+    if c_pa:  out["充值金额"] = pd.to_numeric(df[c_pa], errors="coerce").fillna(0.0)
+    if c_fpu: out["首充人数"] = pd.to_numeric(df[c_fpu], errors="coerce").fillna(0).astype("Int64")
+    if c_fpa: out["当日首充金额"] = pd.to_numeric(df[c_fpa], errors="coerce").fillna(0.0)
+    if c_wd:  out["提现金额"] = pd.to_numeric(df[c_wd], errors="coerce").fillna(0.0)
+    
+    return out.dropna(subset=["日期","总代名称_清洗"])
 
-except Exception as e:
-    print(f"\n[❌ 严重错误] 脚本在运行中发生意外: {e}")
-    print("请检查您的网络连接或网站是否已更新。")
+def std_platform(df):
+    """标准化：平台报表（平台LTV；平台/盘口级）"""
+    c_date = pick_col(df, ALIASES["date"])
+    c_plat = pick_col(df, ALIASES["platform"])
+    out = pd.DataFrame()
+    out["日期"] = df[c_date].map(normalize_date)
+    out["盘口"] = df[c_plat]
+    # LTV
+    for std_key, aliases in [("ltv_D1","ltv_d1"),("ltv_D3","ltv_d3"),("ltv_D7","ltv_d7"),("ltv_D14","ltv_d14"),("ltv_D30","ltv_d30")]:
+        col = pick_col(df, ALIASES[aliases])
+        if col:
+            out[std_key] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return out.dropna(subset=["日期","盘口"])
 
-finally:
-    if driver:
-        driver.quit()
-    print("\n[步骤 3/3] 浏览器已关闭，脚本运行结束。")
+def std_daily(df, name_id_map):
+    """标准化：用户日常（首充/活跃充值）"""
+    c_date    = pick_col(df, ALIASES["date"])
+    c_channel = pick_col(df, ALIASES["channel"])
+    out = pd.DataFrame()
+    out["日期"] = df[c_date].map(normalize_date)
+    if c_channel:
+        out["总代名称"] = df[c_channel]
+        out["总代名称_清洗"] = out["总代名称"].map(strip_tail_parenthesis)
+        # v2.1: 优先使用"代理ID"列
+        c_agent_id = pick_col(df, ALIASES["agent_id"])
+        if c_agent_id:
+            out["总代号"] = pd.to_numeric(df[c_agent_id], errors="coerce").astype("Int64")
+        else:
+            out["总代号"] = out["总代名称_清洗"].map(name_id_map).astype("Int64")
+    # 指标
+    for k, std_name in [("firstpay_u","首充人数"),("firstpay_a","当日首充金额"),("pay_active_u","活跃充值人数")]:
+        col = pick_col(df, ALIASES[k])
+        if col:
+            if "人数" in std_name:
+                out[std_name] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype("Int64")
+            else:
+                out[std_name] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return out.dropna(subset=["日期"])
 
+def std_retention(df, which="login"):
+    """标准化：留存（平台/盘口级为主；如果来源有渠道列，可扩展）"""
+    c_date = pick_col(df, ALIASES["date"])
+    c_plat = pick_col(df, ALIASES["platform"])
+    c_channel = pick_col(df, ALIASES["channel"])
+    
+    # v2.1: 如果找不到日期列，返回空DataFrame
+    if c_date is None:
+        print(f"  [警告] 留存数据缺少日期列，列名: {df.columns.tolist()[:10]}")
+        return pd.DataFrame()
+    
+    out = pd.DataFrame()
+    out["日期"] = df[c_date].map(normalize_date)
+    
+    # If has channel column, use it
+    if c_channel:
+        out["总代名称"] = df[c_channel]
+        out["总代名称_清洗"] = out["总代名称"].map(strip_tail_parenthesis)
+        # v2.1: 优先使用"代理ID"列
+        c_agent_id = pick_col(df, ALIASES["agent_id"])
+        if c_agent_id:
+            out["总代号"] = pd.to_numeric(df[c_agent_id], errors="coerce").astype("Int64")
+        else:
+            out["总代号"] = out["总代名称"].map(extract_agent_id_from_tail)
+    elif c_plat:
+        out["盘口"] = df[c_plat]
+    
+    # D1 D3 D7 D14 D30
+    for d, key in [(1,"D1"),(3,"D3"),(7,"D7"),(14,"D14"),(30,"D30")]:
+        col = pick_col(df, ALIASES["ret_d"+str(d)])
+        if col:
+            out[f"{which}_{key}"] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return out.dropna(subset=["日期"])
+
+def std_fpltv(df):
+    """标准化：首充LTV（平台/盘口级为主）"""
+    c_date = pick_col(df, ALIASES["date"])
+    c_plat = pick_col(df, ALIASES["platform"])
+    out = pd.DataFrame()
+    out["日期"] = df[c_date].map(normalize_date)
+    if c_plat:
+        out["盘口"] = df[c_plat]
+    for key, alias in [("FPLTV_D1","fpltv_d1"),("FPLTV_D2","fpltv_d2"),("FPLTV_D3","fpltv_d3"),("FPLTV_D7","fpltv_d7"),("FPLTV_D15","fpltv_d15"),("FPLTV_D30","fpltv_d30")]:
+        col = pick_col(df, ALIASES[alias]) if alias in ALIASES else None
+        if col:
+            out[key] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return out.dropna(subset=["日期"])
+
+def std_cost(df):
+    """标准化：成本/广告数据（消耗/展示/点击/提现等），可从阈值营收表或广告CSV读取。平台或渠道级都支持。"""
+    c_date = pick_col(df, ALIASES["date"])
+    out = pd.DataFrame()
+    out["日期"] = df[c_date].map(normalize_date)
+    c_channel = pick_col(df, ALIASES["channel"])
+    c_plat    = pick_col(df, ALIASES["platform"])
+    if c_channel:
+        out["总代名称"] = df[c_channel]
+        out["总代名称_清洗"] = out["总代名称"].map(strip_tail_parenthesis)
+    if c_plat:
+        out["盘口"] = df[c_plat]
+    for k, std in [("spend","消耗"),("impr","展示"),("click","点击"),("withdraw","提现金额")]:
+        col = pick_col(df, ALIASES[k])
+        if col:
+            out[std] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return out.dropna(subset=["日期"])
+
+# ----------------------------- 主流程 -----------------------------
+
+def main(input_dir, output_path):
+    files = list_input_files(input_dir)
+    if not files:
+        print(f"[ERROR] 输入目录 {input_dir} 下没有任何数据文件，跳过生成。")
+        return
+    print(f"[INFO] 找到 {len(files)} 个数据文件")
+    
+    # 1) 读取运营数据，构建 name_id_map
+    ops_list = []
+    for p in files:
+        if classify_file_smart(p)=="ops":
+            df = read_any_table(p)
+            result = std_ops(df)
+            if not result.empty:
+                ops_list.append(result)
+    
+    if not ops_list:
+        print("  Warning: No operation data with channel column found, cannot extract agent IDs from names.")
+        name_id_map = {}
+    else:
+        ops = pd.concat(ops_list, ignore_index=True).dropna(subset=["日期","总代名称"])
+        # name -> id（出现次数最多的ID）
+        tmp = ops[["总代名称","总代名称_清洗","总代号"]].dropna(subset=["总代名称_清洗","总代号"])
+        if tmp.empty:
+            name_id_map = {}
+        else:
+            mode_id = (tmp.groupby("总代名称_清洗")["总代号"]
+                         .agg(lambda s: s.value_counts().index[0]))
+            name_id_map = mode_id.to_dict()
+
+    # 2) 逐类来源标准化
+    agent_list, platform_list, daily_list = [], [], []
+    ret_login_list, ret_register_list, ret_fpay_list, ret_play_list = [], [], [], []  # v2.1: 新增ret_play
+    fpltv_list, cost_list = [], []
+
+    for idx, p in enumerate(files, 1):
+        print(f"  处理文件 {idx}/{len(files)}: {os.path.basename(p)}")
+        typ = classify_file_smart(p)
+        print(f"    类型: {typ}")
+        df = read_any_table(p)
+        result = None
+        
+        if typ=="agent":
+            result = std_agent(df, name_id_map)
+            if not result.empty:
+                agent_list.append(result)
+        elif typ=="platform":
+            result = std_platform(df)
+            if not result.empty:
+                platform_list.append(result)
+        elif typ=="daily":
+            result = std_daily(df, name_id_map)
+            if not result.empty:
+                daily_list.append(result)
+        elif typ=="ret_login":
+            result = std_retention(df, which="ret_login")
+            if not result.empty:
+                ret_login_list.append(result)
+        elif typ=="ret_register":
+            result = std_retention(df, which="ret_register")
+            if not result.empty:
+                ret_register_list.append(result)
+        elif typ=="ret_fpay":
+            result = std_retention(df, which="ret_fpay")
+            if not result.empty:
+                ret_fpay_list.append(result)
+        elif typ=="ret_play":  # v2.1: 新增下注留存处理
+            result = std_retention(df, which="ret_play")
+            if not result.empty:
+                ret_play_list.append(result)
+        elif typ=="fpltv":
+            result = std_fpltv(df)
+            if not result.empty:
+                fpltv_list.append(result)
+        elif typ=="cost":
+            result = std_cost(df)
+            if not result.empty:
+                cost_list.append(result)
+        else:
+            # 其他未知文件忽略
+            pass
+
+    # 合并各来源
+    agent = pd.concat(agent_list, ignore_index=True) if agent_list else pd.DataFrame(columns=["日期","总代名称","总代名称_清洗","总代号"])
+    daily  = pd.concat(daily_list, ignore_index=True) if daily_list else pd.DataFrame(columns=["日期"])
+    platform = pd.concat(platform_list, ignore_index=True) if platform_list else pd.DataFrame(columns=["日期","盘口"])
+    ret_login = pd.concat(ret_login_list, ignore_index=True) if ret_login_list else pd.DataFrame(columns=["日期"])
+    ret_register = pd.concat(ret_register_list, ignore_index=True) if ret_register_list else pd.DataFrame(columns=["日期"])
+    ret_fpay = pd.concat(ret_fpay_list, ignore_index=True) if ret_fpay_list else pd.DataFrame(columns=["日期"])
+    ret_play = pd.concat(ret_play_list, ignore_index=True) if ret_play_list else pd.DataFrame(columns=["日期"])  # v2.1: 新增下注留存
+    fpltv = pd.concat(fpltv_list, ignore_index=True) if fpltv_list else pd.DataFrame(columns=["日期"])
+    cost  = pd.concat(cost_list, ignore_index=True) if cost_list else pd.DataFrame(columns=["日期"])
+
+    # 3) 生成主键并广播平台级
+    # 主集合：尽量以 agent/daily/ops/retention 的渠道级行为基础（必须有 日期、总代号 或 名称可映射）
+    base_keys = None
+    # 先用 agent
+    if not agent.empty:
+        base_keys = agent[["日期","总代名称","总代名称_清洗","总代号"]].drop_duplicates()
+    elif not daily.empty and "总代号" in daily.columns:
+        base_keys = daily[["日期","总代名称","总代名称_清洗","总代号"]].dropna(subset=["总代号"]).drop_duplicates()
+    elif ops_list:
+        ops_all = pd.concat(ops_list, ignore_index=True)
+        base_keys = ops_all[["日期","总代名称","总代名称_清洗","总代号"]].drop_duplicates()
+    # Try retention data as fallback
+    elif not ret_fpay.empty and "总代名称" in ret_fpay.columns:
+        base_keys = ret_fpay[["日期","总代名称","总代名称_清洗","总代号"]].drop_duplicates()
+    elif not ret_play.empty and "总代名称" in ret_play.columns:  # v2.1: 新增ret_play fallback
+        base_keys = ret_play[["日期","总代名称","总代名称_清洗","总代号"]].drop_duplicates()
+    elif not ret_login.empty and "总代名称" in ret_login.columns:
+        base_keys = ret_login[["日期","总代名称","总代名称_清洗","总代号"]].drop_duplicates()
+    elif not ret_register.empty and "总代名称" in ret_register.columns:
+        base_keys = ret_register[["日期","总代名称","总代名称_清洗","总代号"]].drop_duplicates()
+    else:
+        print("  Error: No channel-level data source found, cannot generate report.")
+        base_keys = pd.DataFrame(columns=["日期","总代名称","总代名称_清洗","总代号"])
+
+    # Check if base_keys is empty or missing required columns
+    print(f"  Base keys shape: {base_keys.shape if isinstance(base_keys, pd.DataFrame) else 'None'}")
+    if base_keys.empty or "总代名称_清洗" not in base_keys.columns:
+        print("  Error: No valid channel data found. Cannot generate report.")
+        print("  Please ensure at least one data source contains channel/agent names.")
+        return
+    
+    print(f"  Base keys: {len(base_keys)} unique channel-date combinations")
+    
+    # 解析命名串（产品/部门/方式等）
+    parse_df = base_keys.copy()
+    parsed = parse_df["总代名称_清洗"].map(parse_channel_clean).apply(pd.Series)
+    parse_df = pd.concat([parse_df, parsed], axis=1)
+    print(f"  After parsing: {len(parse_df)} rows")
+
+    # 盘口：优先来源字段；若无则由部门映射
+    # 准备一个平台来源按[日期,盘口]的唯一键，方便后续广播
+    plat_keys = platform[["日期","盘口"]].dropna().drop_duplicates() if not platform.empty else pd.DataFrame(columns=["日期","盘口"])
+    
+    # 1) 先用命名串的第1段（现在是"盘口_token"）
+    if "盘口_token" in parse_df.columns:
+        parse_df["盘口"] = parse_df["盘口_token"]
+    else:
+        parse_df["盘口"] = None
+    
+    # 2) 再用"部门→盘口"兜底（只在空值处回填）
+    if "推广部门" in parse_df.columns:
+        parse_df["盘口"] = parse_df["盘口"].fillna(parse_df["推广部门"].map(DEPT_TO_PLATFORM))
+
+    # 4) 组建主表并左连接各指标
+    main = parse_df.copy()  # 含：日期、总代名称(_清洗)、总代号、产品、推广部门、推广方式、盘口(可能为空)
+    print(f"  Main table initialized: {len(main)} rows, {len(main.columns)} columns")
+    
+    # Check if we have valid agent IDs
+    valid_ids = main["总代号"].notna().sum()
+    print(f"  Valid agent IDs: {valid_ids} / {len(main)}")
+    
+    # 若缺ID，用稳定ID兜底，后续主键与聚合才可用
+    if valid_ids < len(main):
+        main["总代号"] = main["总代号"].where(
+            main["总代号"].notna(),
+            main["总代名称_清洗"].map(stable_agent_id)
+        )
+        print(f"  After stable ID fill: {main['总代号'].notna().sum()} / {len(main)} have IDs")
+    
+    # Determine merge strategy: if no valid IDs, use name_clean instead
+    use_id_merge = main["总代号"].notna().sum() > 0
+    merge_keys = ["日期", "总代号"] if use_id_merge else ["日期", "总代名称_清洗"]
+    print(f"  Using merge keys: {'date+id' if use_id_merge else 'date+name_clean'}")
+    
+    # 代理：注册/活跃/充值/首充/提现
+    if not agent.empty:
+        print(f"  Merging agent data: {len(agent)} rows")
+        agent_merge_cols = [c for c in merge_keys if c in agent.columns]
+        if agent_merge_cols and all(k in agent.columns for k in merge_keys):
+            # 只选择存在的列
+            data_cols = [c for c in ["注册人数","活跃人数","充值人数","充值金额","首充人数","当日首充金额","提现金额"] if c in agent.columns]
+            if data_cols:
+                tmp = agent[merge_keys + data_cols].copy()
+                # 调试：合并前的数据
+                if '充值金额' in tmp.columns:
+                    print(f"  Before merge - agent充值金额总和: {tmp['充值金额'].sum():.2f}")
+                # 调试：检查合并键匹配
+                main_keys_set = set(zip(main[merge_keys[0]], main[merge_keys[1]]))
+                tmp_keys_set = set(zip(tmp[merge_keys[0]], tmp[merge_keys[1]]))
+                matched_keys = main_keys_set & tmp_keys_set
+                print(f"  Merge key match: main={len(main_keys_set)}, agent={len(tmp_keys_set)}, matched={len(matched_keys)}")
+                if len(matched_keys) == 0:
+                    print(f"  WARNING: 合并键完全不匹配！")
+                    print(f"  Sample main keys: {list(main_keys_set)[:3]}")
+                    print(f"  Sample agent keys: {list(tmp_keys_set)[:3]}")
+                main = main.merge(tmp, on=merge_keys, how="left")
+                print(f"  After agent merge: {len(main)} rows, columns: {data_cols}")
+                # 调试：合并后的数据
+                if '充值金额' in main.columns:
+                    print(f"  After merge - main充值金额总和: {main['充值金额'].sum():.2f}")
+            else:
+                print(f"  Skip agent merge: no data columns found")
+        else:
+            print(f"  Skip agent merge: missing keys")
+
+    # 日常：首充、活跃充值
+    if not daily.empty:
+        daily_keys = [k for k in merge_keys if k in daily.columns]
+        if daily_keys and len(daily_keys) == len(merge_keys):
+            cols = daily_keys + [c for c in ["当日首充金额","首充人数","活跃充值人数"] if c in daily.columns]
+            tmp = daily[cols].copy()
+            main = main.merge(tmp, on=daily_keys, how="left", suffixes=("",""))
+
+    # 成本/广告（既支持渠道级，也支持平台级）
+    # 渠道级
+    if not cost.empty and "总代名称_清洗" in cost.columns:
+        tmp = cost[["日期","总代名称_清洗","消耗","展示","点击","提现金额"]].copy()
+        main = main.merge(tmp, on=["日期","总代名称_清洗"], how="left")
+    # 平台级（广播）
+    if not cost.empty and "盘口" in cost.columns:
+        tmp = cost[["日期","盘口","消耗","展示","点击","提现金额"]].copy()
+        # 防止覆盖渠道级的非空数值：只在空值处用平台级补
+        main = main.merge(tmp, on=["日期","盘口"], how="left", suffixes=("","_plat"))
+        for col in ["消耗","展示","点击","提现金额"]:
+            if col+"_plat" in main.columns:
+                main[col] = main[col].fillna(main[col+"_plat"])
+                main.drop(columns=[col+"_plat"], inplace=True)
+
+    # 平台LTV（广播）
+    if not platform.empty:
+        tmp = platform.copy()
+        # 映射到标准列名
+        rename_map = {"ltv_D1":"首充当日ltv替代_D1",
+                      "ltv_D3":"平台LTV_D3","ltv_D7":"平台LTV_D7","ltv_D14":"平台LTV_D14","ltv_D30":"平台LTV_D30"}
+        tmp.rename(columns=rename_map, inplace=True)
+        main = main.merge(tmp[["日期","盘口"]+list(rename_map.values())], on=["日期","盘口"], how="left")
+
+    # 首充LTV（广播，用于偏移列 & 当日 LTV）
+    if not fpltv.empty:
+        # v2.1: 检查必需列是否存在
+        required_cols = ["日期","盘口","FPLTV_D1","FPLTV_D2","FPLTV_D3","FPLTV_D7","FPLTV_D15","FPLTV_D30"]
+        existing_cols = [c for c in required_cols if c in fpltv.columns]
+        if len(existing_cols) >= 2:  # 至少有日期和一个FPLTV列
+            tmp = fpltv[existing_cols].copy()
+            merge_keys = [k for k in ["日期","盘口"] if k in existing_cols]
+            if merge_keys:
+                main = main.merge(tmp, on=merge_keys, how="left")
+        else:
+            print(f"  [警告] FPLTV数据缺少必需列，跳过合并。现有列: {fpltv.columns.tolist()[:10]}")
+
+    # 留存（用于复登率_偏移：优先用首充留存；缺则用下注留存；再缺用首登留存；最后用注册留存）
+    # v2.1: 新增ret_play选项
+    ret_pick = {}
+    if not ret_fpay.empty:
+        ret_pick = ret_fpay.copy()
+    elif not ret_play.empty:  # v2.1: 新增优先级
+        ret_pick = ret_play.copy()
+    elif not ret_login.empty:
+        ret_pick = ret_login.copy()
+    elif not ret_register.empty:
+        ret_pick = ret_register.copy()
+    if isinstance(ret_pick, pd.DataFrame) and not ret_pick.empty:
+        # 列可能是 ret_fpay_Dx 或 ret_login_Dx 等，统一挑选
+        # Determine merge keys based on what's available
+        merge_keys = ["日期"]
+        if "盘口" in ret_pick.columns and "盘口" in main.columns:
+            merge_keys.append("盘口")
+        if "总代名称_清洗" in ret_pick.columns and "总代名称_清洗" in main.columns:
+            merge_keys.append("总代名称_清洗")
+        
+        keep = merge_keys + [c for c in ret_pick.columns if any(k in c for k in ["D1","D3","D7","D14","D30"])]
+        keep = [c for c in keep if c in ret_pick.columns]  # Filter to existing columns
+        tmp = ret_pick[keep].copy()
+        main = main.merge(tmp, on=merge_keys, how="left", suffixes=("","_ret"))
+
+    # 5) 指标计算与缺省处理
+    def num(col_name, default_val=0): 
+        if col_name in main.columns:
+            return pd.to_numeric(main[col_name], errors="coerce").fillna(default_val)
+        else:
+            return pd.Series([default_val] * len(main), index=main.index)
+
+    # 衍生
+    main["注册人数"]     = num("注册人数", 0).astype("Int64")
+    main["活跃人数"]     = num("活跃人数", 0).astype("Int64")
+    main["充值人数"]     = num("充值人数", 0).astype("Int64")
+    main["充值金额"]     = num("充值金额", 0.0)
+    main["当日首充金额"] = num("当日首充金额", 0.0)
+    main["首充人数"]     = num("首充人数", 0).astype("Int64")
+    main["展示"]         = num("展示", 0).astype("Int64")
+    main["点击"]         = num("点击", 0).astype("Int64")
+    main["消耗"]         = num("消耗", 0.0)
+    main["提现金额"]     = num("提现金额", 0.0)
+
+    # —— 充提差：如果提现金额有来源：充值金额 - 提现金额；否则按 0（或使用你们的其他公式）
+    main["充提差"] = (main["充值金额"] - main["提现金额"]).fillna(0.0)
+
+    # 千展成本crm
+    main["千展成本crm"] = main.apply(lambda r: (r["消耗"] / (r["展示"]/1000.0)) if r["展示"]>0 else 0.0, axis=1)
+    # 点击率
+    main["点击率"] = main.apply(lambda r: (r["点击"] / r["展示"]) if r["展示"]>0 else 0.0, axis=1)
+    # 注册成本 / 首充成本
+    main["注册成本"]   = main.apply(lambda r: (r["消耗"] / r["注册人数"]) if r["注册人数"] and r["注册人数"]>0 else 0.0, axis=1)
+    main["首充成本"]   = main.apply(lambda r: (r["消耗"] / r["首充人数"]) if r["首充人数"] and r["首充人数"]>0 else 0.0, axis=1)
+    # 一级首充人数/成本（需要业务规则；默认 0）
+    main["一级首充人数"]  = 0
+    main["一级首充成本"]  = 0.0
+
+    # 首充转化率 / 首充arppu / 首充roas
+    main["首充转化率"] = main.apply(lambda r: (r["首充人数"]/r["注册人数"]) if r["注册人数"] and r["注册人数"]>0 else 0.0, axis=1)
+    main["首充arppu"] = main.apply(lambda r: (r["当日首充金额"]/r["首充人数"]) if r["首充人数"] and r["首充人数"]>0 else 0.0, axis=1)
+    main["首充roas"] = main.apply(lambda r: (r["当日首充金额"]/r["消耗"]) if r["消耗"]>0 else 0.0, axis=1)
+
+    # 首充当日ltv（优先用首充LTV_D1；没有就用平台LTV_D1 替代）
+    main["首充当日ltv"] = num("FPLTV_D1", 0.0)
+
+    # 首充当日roi（按你的口径可改；这里示例用：首充当日充提差 / 消耗）
+    # 先算 首充当日充提差 = 当日首充金额 - 当日首提金额（若有；否则用 充值金额-提现金额 的当天近似）
+    main["首充当日充提差"] = (main["当日首充金额"] - 0.0)  # 无首提数据则先按 0
+    main["首充当日roi"] = main.apply(lambda r: (r["首充当日充提差"]/r["消耗"]) if r["消耗"]>0 else 0.0, axis=1)
+
+    # 首充充提差比 = 首充当日充提差 / 当日首充金额
+    main["首充充提差比"] = main.apply(lambda r: (r["首充当日充提差"]/r["当日首充金额"]) if r["当日首充金额"]>0 else 0.0, axis=1)
+
+    # 偏移 LTV（来自 FPLTV）
+    main["首充两日ltv_偏移"]   = num("FPLTV_D2", 0.0)
+    main["首充三日ltv_偏移"]   = num("FPLTV_D3", 0.0)
+    main["首充七日ltv_偏移"]   = num("FPLTV_D7", 0.0)
+    main["首充十五日ltv_偏移"] = num("FPLTV_D15", 0.0)
+    main["首充三十日ltv_偏移"] = num("FPLTV_D30", 0.0)
+
+    # 偏移 复登/复投/复充率：这里默认用"留存"作为复登近似（首充留存优先），复投/复充默认 0（如需可接事件口径）
+    # v2.1: 新增ret_play支持
+    # 复登率
+    def pick_ret(col_prefix):
+        for prefix in ["ret_fpay","ret_play","ret_login","ret_register"]:  # v2.1: 新增ret_play
+            c = f"{prefix}_{col_prefix}"
+            if c in main.columns:
+                return num(main[c]).fillna(0.0)
+        return pd.Series(0.0, index=main.index)
+    main["首充次日复登率_偏移"]   = pick_ret("D1")
+    main["首充三日复登率_偏移"]   = pick_ret("D3")
+    main["首充七日复登率_偏移"]   = pick_ret("D7")
+    main["首充十五日复登率_偏移"] = pick_ret("D14")
+    main["首充三十日复登率_偏移"] = pick_ret("D30")
+
+    # 复投率/复充率（无事件源时置 0；若你们有事件明细，可在这里接入计算）
+    for col in ["首充次日复投率_偏移","首充三日复投率_偏移","首充七日复投率_偏移","首充十五日复投率_偏移","首充三十日复投率_偏移",
+                "首充次日复充率_偏移","首充三日复充率_偏移","首充七日复充率_偏移","首充十五日复充率_偏移","首充三十日复充率_偏移"]:
+        main[col] = 0.0
+
+    # 累计roas / 自然月消耗（按窗口累计）
+    main["累计roas"] = 0.0
+    main["自然月消耗"] = 0.0
+    # 如果需要真实累计，可在此按 [总代号, 盘口] 分组对 日期 排序后做滚动累积。
+    # 例如：
+    # main.sort_values(["总代号","盘口","日期"], inplace=True)
+    # main["累计充值金额"] = main.groupby(["总代号","盘口"])["充值金额"].cumsum()
+    # main["累计消耗"]   = main.groupby(["总代号","盘口"])["消耗"].cumsum()
+    # main["累计roas"]  = main.apply(lambda r: (r["累计充值金额"]/r["累计消耗"]) if r["累计消耗"]>0 else 0.0, axis=1)
+    # main["自然月"]     = main["日期"].str.slice(0,7)
+    # main["自然月消耗"] = main.groupby(["总代号","盘口","自然月"])["消耗"].transform("sum")
+
+    # 非一级占比（默认无标注则为 0；如需请完善 is_primary_channel 逻辑）
+    main["非一级首充人数/首充人数"] = 0.0
+    main["非一级首充人数/充值人数"] = 0.0
+
+    # 6) 填充其他维度列
+    main["产品"] = main["产品"].fillna("")
+    main["推广方式"] = main["推广方式"].fillna("")
+    main["总代名称"] = main["总代名称"].fillna(main["总代名称_清洗"])
+    # 日期必须存在，总代号或总代名称至少有一个
+    main = main.dropna(subset=["日期"])
+    # If no valid IDs, at least need name_clean
+    if valid_ids == 0:
+        main = main.dropna(subset=["总代名称_清洗"])
+
+    # 7) 输出 53 列（缺失列补 0/空），顺序锁定
+    print(f"  Before adding missing columns: {len(main)} rows")
+    for col in FINAL_COLUMNS:
+        if col not in main.columns:
+            # 默认缺失：数值 0，文本空
+            if col in ["日期","产品","盘口","总代名称","推广部门","推广方式"]:
+                main[col] = ""
+            else:
+                main[col] = 0.0
+    print(f"  After adding missing columns: {len(main)} rows")
+
+    # 列类型微调：整数列
+    for icol in ["注册人数","首充人数","一级首充人数","充值人数","展示","点击"]:
+        if icol in main.columns:
+            main[icol] = pd.to_numeric(main[icol], errors="coerce").fillna(0).astype("Int64")
+
+    # 聚合与去重：统一按 [日期, 盘口, 总代号] 进行分组聚合
+    print(f"  Before aggregation: {len(main)} rows")
+    
+    # 调试：聚合前的数据统计
+    if '充值金额' in main.columns:
+        print(f"  Before agg - 充值金额总和: {main['充值金额'].sum():.2f}")
+    
+    if len(main) > 0:
+        group_cols = [c for c in ["日期", "盘口", "总代号"] if c in main.columns]
+        if group_cols:
+            # 定义聚合规则：文本列取第一个值，数值列求和
+            agg_dict = {}
+            for col in main.columns:
+                if col in group_cols:
+                    continue
+                # 检查列的数据类型
+                if pd.api.types.is_numeric_dtype(main[col]):
+                    agg_dict[col] = 'sum'  # 数值列求和
+                else:
+                    agg_dict[col] = 'first'  # 文本列取第一个值
+            
+            main = main.groupby(group_cols, as_index=False).agg(agg_dict)
+            print(f"  After aggregation: {len(main)} rows (grouped by date+platform+id)")
+            
+            # 调试：聚合后的数据统计
+            if '充值金额' in main.columns:
+                print(f"  After agg - 充值金额总和: {main['充值金额'].sum():.2f}")
+            
+            main = main.sort_values(group_cols)
+    
+    # 只保留 53 列顺序
+    main = main[FINAL_COLUMNS]
+
+    # 检查是否有数据
+    if len(main) == 0:
+        print(f"[ERROR] 清洗后没有任何数据行，跳过生成文件。")
+        print(f"   请检查数据源是否包含必要的【日期】和【总代名称/渠道】列。")
+        return
+
+    # 写出 Excel
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        main.to_excel(writer, sheet_name="DailyAgentData", index=False)
+    print(f"Report generated successfully: {len(main)} rows, 53 columns")
+    
+    # Save summary to file
+    with open("generation_summary.txt", "w", encoding="utf-8") as f:
+        f.write(f"Report: {os.path.basename(output_path)}\n")
+        f.write(f"Rows: {len(main)}\n")
+        f.write(f"Columns: {len(main.columns)}\n")
+    print("Summary saved to: generation_summary.txt")
+
+
+if __name__ == "__main__":
+    pd.set_option("future.no_silent_downcasting", True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", "-i", default=".", help="输入目录（放置所有数据源的文件夹）")
+    parser.add_argument("--output","-o", default=f"每日总代数据_自动生成.xlsx", help="输出Excel路径")
+    args = parser.parse_args()
+    main(args.input, args.output)
