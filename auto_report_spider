@@ -1,0 +1,1587 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+代理日报表自动下载爬虫
+功能：
+1. 自动登录各后台系统（支持免验证码自动登录、验证码人工登录）
+2. 进入"代理报表"页面，逐日点击最近10天的"导出"按钮
+3. 刷新页面后进入"下载列表"，等待任务完成
+4. 下载文件，从CSV内部提取日期字段，按"产品-平台-地区-部门-日期.csv"命名
+5. 自动处理下一个站点
+"""
+
+import os
+import time
+import json
+import shutil
+import re
+import sys
+from datetime import date, timedelta
+from dataclasses import dataclass
+from typing import List, Optional
+import traceback
+
+import pandas as pd
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver import Chrome, ChromeOptions
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+
+# ========== 配置参数 ==========
+LAST_N_DAYS = 1                      # 导出最近 N 天的报表（改为1天，只导出昨天）
+HEADLESS = False                     # 是否无头模式（需人工验证码时必须 False）
+GLOBAL_TIMEOUT = 30                  # 通用元素等待秒数
+TASK_TIMEOUT_PER_DAY = 600           # 等待单日任务完成的最长秒数（10分钟）
+POLL_INTERVAL = 3                    # 轮询间隔秒数
+DOWNLOAD_WAIT = 120                  # 等待文件下载完成的最长秒数
+
+# ========== v2.0 新增参数 ==========
+MAX_ROUNDS = 2                       # 下载阶段最大轮询次数
+ROUND_INTERVAL = 3                   # 轮询间隔秒数（每轮之间等待时间）
+
+# ========== 运行范围控制（新增） ==========
+# 仅测试前 N 个站点。设置为 None/0 表示全部站点
+TEST_FIRST_N_SITES: int | None = 1  # 改为None，跑所有站点
+
+# 只跑指定平台（逗号分隔）。为空列表表示不过滤
+# 例如：ONLY_PLATFORMS = ["OK7", "58", "AI7"]
+ONLY_PLATFORMS: list[str] = []
+
+# 排除指定平台（逗号分隔）。为空列表表示不过滤
+# 例如：不再爬取bra1，新增hot77
+EXCLUDE_PLATFORMS: list[str] = ["bra1"]
+
+# ========== 历史数据补齐配置（v2.2新增） ==========
+ENABLE_HISTORY_MODE = True          # 是否启用历史数据补齐模式
+HISTORY_START_DATE = "2025-10-01"    # 历史数据起始日期（包含，格式：YYYY-MM-DD）
+HISTORY_END_DATE = "2025-10-02"      # 历史数据结束日期（包含，格式：YYYY-MM-DD）
+# 重要说明：
+# - 历史模式下只爬取代理报表，不爬取LTV和留存数据
+# - 历史模式会先执行，然后再执行当前模式（爬昨天的全部数据）
+# - 设置 ENABLE_HISTORY_MODE = False 可关闭历史补齐功能
+
+# ========== 选择器配置 ==========
+# 导航选择器
+REPORT_NAV_CSS = 'a[data-title="代理报表"], a[href*="/data_export/agent_reports"]'
+DOWNLOAD_TAB_CSS = 'a[data-title="下载列表"], a[href*="/system/backend_tasks"]'
+
+# ===== v2.0 新增导航选择器 =====
+FIRST_PAID_LTV_NAV_CSS = 'a[data-title="首充用户LTV"], a[href*="/data_report/first_paid_ltv"]'
+USER_RETENTION_NAV_CSS = 'a[href*="/data_report/user_retentions"], span:contains("用户留存")'
+
+# ===== 代理报表相关选择器 =====
+# 导出按钮：直接匹配 href 包含日期的链接
+EXPORT_BTN_HREF_TMPL = 'a[href*="/data_export/agent_reports/export?date={}"]'
+# 或者通过行查找（备用）
+EXPORT_ROW_XPATH_TMPL = '//tr[contains(.,"{date}")]//a[contains(@href,"export") or contains(text(),"导出")]'
+
+# ===== v2.0 新增: 首充用户LTV选择器 =====
+FIRST_PAID_LTV_EXPORT_BTN_XPATH = '//button[contains(@class,"ant-btn")]//span[contains(text(),"创建导出任务")]'
+
+# ===== v2.0 新增: 用户留存选择器 =====
+# 留存类型标签页
+RETENTION_TAB_XPATH_TMPL = '//a[@role="tab"][@href="/data_report/user_retentions?user_type={user_type}"]'
+# 留存类型定义
+RETENTION_USER_TYPES = {
+    "first_login_user": "首充用户登录留存",
+    "first_play_user": "首充用户下注留存",
+    "first_pay_user": "首充用户付费留存"
+}
+# 昨天快捷按钮
+RETENTION_YESTERDAY_BTN_XPATH = '//a[contains(@class,"btn") and contains(@class,"btn-outline") and contains(@href,"start_time") and contains(text(),"昨天")]'
+# 全部代理下拉菜单
+RETENTION_AGENT_DROPDOWN_CSS = 'div[data-channel-selector-target="agentSelectedText"]'
+# 全选按钮
+RETENTION_SELECT_ALL_BTN_CSS = 'button[data-action*="selectAllAgents"]'
+# 导出按钮
+RETENTION_EXPORT_BTN_CSS = 'button[type="submit"][formaction*="/data_report/user_retentions/export"]'
+
+# ===== 任务状态选择器 =====
+TASK_ROW_XPATH_TMPL = '//tr[contains(.,"代理日报表") and contains(.,"{date}")]'
+TASK_DONE_XPATH = './/*[contains(text(),"已完成") or contains(@class,"badge-success")]'
+TASK_DOWNLOAD_XPATH = './/a[contains(@href,"/download") or contains(text(),"下载")]'
+
+# ===== v2.0 新增: 智能任务匹配（支持多种任务类型） =====
+TASK_PATTERNS = {
+    "agent_report": r"代理.*报表|代理日报表",
+    "first_paid_ltv": r"首充.*LTV|LTV",
+    "retention": r"用户留存",  # 留存任务统一匹配（后台任务名不包含具体类型）
+}
+
+# 目录配置
+COOKIES_DIR = 'cookies'              # cookie 保存目录
+DOWNLOADS_ROOT = 'downloads'         # 下载根目录
+
+# ========== 数据类 ==========
+@dataclass
+class Site:
+    """站点信息"""
+    product: str      # 产品
+    platform: str     # 平台
+    system: str       # 系统类型
+    region: str       # 地区
+    dept: str         # 部门
+    url: str          # 后台网址
+    username: str     # 账号
+    password: str     # 密码
+    no_captcha: bool  # 是否免验证码
+
+
+# ========== 工具函数 ==========
+def ensure_dirs(path: str):
+    """确保目录存在"""
+    os.makedirs(path, exist_ok=True)
+
+
+def sanitize_filename(name: str) -> str:
+    """清理文件名中的非法字符"""
+    return re.sub(r'[<>:"/\\|?*]', '_', name)
+
+
+def sanitize_host(url: str) -> str:
+    """从URL提取主机名并清理"""
+    host = re.sub(r'^https?://', '', url).strip('/').split('/')[0]
+    return host.replace(':', '_').replace('.', '_')
+
+
+def setup_driver(download_dir: str) -> Chrome:
+    """初始化 Chrome WebDriver"""
+    ensure_dirs(download_dir)
+    opts = ChromeOptions()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option('useAutomationExtension', False)
+    
+    # 添加独立的用户数据目录，避免冲突
+    user_data_dir = os.path.abspath("chrome_user_data")
+    ensure_dirs(user_data_dir)
+    opts.add_argument(f"--user-data-dir={user_data_dir}")
+    
+    # 禁用一些可能导致错误的功能
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+    
+    # 忽略证书错误
+    opts.add_argument("--ignore-certificate-errors")
+    opts.add_argument("--ignore-ssl-errors")
+    
+    # 下载配置
+    prefs = {
+        "download.default_directory": os.path.abspath(download_dir),
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+        # 禁用开发者工具的一些警告
+        "profile.default_content_setting_values.notifications": 2,
+    }
+    opts.add_experimental_option("prefs", prefs)
+    
+    # 禁用日志输出
+    opts.add_experimental_option('excludeSwitches', ['enable-logging'])
+    
+    service = Service(ChromeDriverManager().install())
+    driver = Chrome(service=service, options=opts)
+    return driver
+
+
+def read_sites(csv_path: str) -> List[Site]:
+    """从CSV读取站点配置"""
+    df = pd.read_csv(csv_path, encoding='utf-8')
+    
+    def pick(row, names):
+        """从行中选择第一个非空列值"""
+        for n in names:
+            if n in row and not pd.isna(row[n]):
+                return str(row[n]).strip()
+        return ""
+    
+    sites: List[Site] = []
+    for _, r in df.iterrows():
+        sites.append(Site(
+            product=pick(r, ['产品', '产品类', '产品类型']),
+            platform=pick(r, ['平台']),
+            system=pick(r, ['系统类型']),
+            region=pick(r, ['地区']),
+            dept=pick(r, ['部门']),
+            url=pick(r, ['后台网址', 'URL', '链接']),
+            username=pick(r, ['ID', '账号', '用户名', 'user']),
+            password=pick(r, ['密码', 'key', 'pass']),
+            no_captcha=pick(r, ['是否免验证码', '免验证码']).startswith(('是', 'Y', 'y', '1', 'true'))
+        ))
+    return sites
+
+
+def date_list(n: int) -> List[str]:
+    """生成最近 N 天的日期列表（从昨天开始）"""
+    today = date.today()
+    return [(today - timedelta(days=i+1)).isoformat() for i in range(n)]
+
+
+def wait_element(driver: Chrome, by: By, locator: str, timeout: int = GLOBAL_TIMEOUT):
+    """等待元素出现"""
+    return WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((by, locator))
+    )
+
+
+def click_when_clickable(driver: Chrome, by: By, locator: str, timeout: int = GLOBAL_TIMEOUT):
+    """等待元素可点击并点击"""
+    el = WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((by, locator))
+    )
+    el.click()
+    return el
+
+
+# ========== Cookie 管理 ==========
+def get_cookie_path(site: Site) -> str:
+    """获取cookie文件路径"""
+    site_key = f"{sanitize_host(site.url)}_{site.platform}_{site.username}"
+    return os.path.join(COOKIES_DIR, f"{site_key}.json")
+
+
+def save_cookies(driver: Chrome, site: Site):
+    """保存当前会话的cookies"""
+    ensure_dirs(COOKIES_DIR)
+    path = get_cookie_path(site)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(driver.get_cookies(), f, ensure_ascii=False, indent=2)
+    print(f"[Cookie] 已保存: {path}")
+
+
+def load_cookies(driver: Chrome, site: Site) -> bool:
+    """加载已保存的cookies"""
+    path = get_cookie_path(site)
+    if not os.path.exists(path):
+        return False
+    
+    try:
+        driver.get(site.url)
+        time.sleep(2)
+        with open(path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        for c in cookies:
+            c.pop('domain', None)  # 移除domain让浏览器自适配
+            c.pop('sameSite', None)  # 避免sameSite问题
+            try:
+                driver.add_cookie(c)
+            except Exception:
+                pass
+        driver.refresh()
+        time.sleep(3)
+        print(f"[Cookie] 已加载: {path}")
+        return True
+    except Exception as e:
+        print(f"[Cookie] 加载失败: {e}")
+        return False
+
+
+# ========== 登录逻辑 ==========
+def auto_login(driver: Chrome, site: Site) -> bool:
+    """自动登录（免验证码）"""
+    try:
+        driver.get(site.url)
+        time.sleep(3)
+        
+        # 通用选择器查找输入框
+        def find_visible_input(selectors):
+            for sel in selectors:
+                try:
+                    els = driver.find_elements(By.CSS_SELECTOR, sel)
+                    for e in els:
+                        if e.is_displayed():
+                            return e
+                except Exception:
+                    pass
+            return None
+        
+        # 查找用户名输入框
+        user_input = find_visible_input([
+            'input[name*="user"]',
+            'input[name*="name"]', 
+            'input[name*="account"]',
+            'input[autocomplete*="username"]',
+            'input[type="text"]:not([name*="captcha"]):not([placeholder*="验"])'
+        ])
+        
+        # 查找密码输入框
+        pwd_input = find_visible_input([
+            'input[type="password"]',
+            'input[name*="pass"]',
+            'input[name*="pwd"]'
+        ])
+        
+        # 查找登录按钮
+        login_btn = find_visible_input([
+            'button[type="submit"]',
+            'button:not([type="button"]):not([type="reset"])',
+            'input[type="submit"]',
+            'a.button',
+            'button'
+        ])
+        
+        if not user_input or not pwd_input or not login_btn:
+            print("[登录] 未找到登录表单元素，转人工登录")
+            return False
+        
+        # 填写并提交
+        user_input.clear()
+        user_input.send_keys(site.username)
+        time.sleep(0.5)
+        
+        pwd_input.clear()
+        pwd_input.send_keys(site.password)
+        time.sleep(0.5)
+        
+        login_btn.click()
+        
+        # 等待登录成功（检测导航栏出现）
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, REPORT_NAV_CSS))
+            )
+            print("[登录] 自动登录成功")
+            save_cookies(driver, site)
+            return True
+        except Exception:
+            # 可能有验证码或其他问题
+            print("[登录] 自动登录超时，可能需要验证码")
+            return False
+            
+    except Exception as e:
+        print(f"[登录] 自动登录异常: {e}")
+        return False
+
+
+def manual_login(driver: Chrome, site: Site):
+    """人工登录（验证码站点）"""
+    driver.get(site.url)
+    print(f"\n{'='*60}")
+    print(f"[人工登录] 请在浏览器中完成登录")
+    print(f"站点: {site.platform} - {site.url}")
+    print(f"账号: {site.username}")
+    print(f"密码: {site.password}")
+    print(f"完成登录后程序将自动继续（最长等待3分钟）")
+    print(f"{'='*60}\n")
+    
+    # 轮询检测是否登录成功
+    try:
+        WebDriverWait(driver, 180).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, REPORT_NAV_CSS))
+        )
+        print("[登录] 人工登录成功")
+        save_cookies(driver, site)
+    except Exception:
+        print("[登录] 人工登录超时，跳过该站点")
+        raise
+
+
+def smart_login(driver: Chrome, site: Site):
+    """智能登录：尝试cookie -> 自动登录 -> 人工登录"""
+    # 1. 尝试使用已保存的cookie
+    if load_cookies(driver, site):
+        # 检查是否已登录
+        try:
+            driver.find_element(By.CSS_SELECTOR, REPORT_NAV_CSS)
+            print("[登录] Cookie有效，已登录")
+            return
+        except Exception:
+            print("[登录] Cookie已失效")
+    
+    # 2. 尝试自动登录
+    if site.no_captcha:
+        if auto_login(driver, site):
+            return
+    
+    # 3. 人工登录
+    manual_login(driver, site)
+
+
+# ========== 页面操作 ==========
+def switch_to_main_content(driver):
+    """
+    尝试切换到主内容iframe（如果存在）
+    返回True表示成功切换到iframe，False表示没有iframe
+    """
+    # 回到根
+    driver.switch_to.default_content()
+    
+    # 尝试多种可能的iframe选择器
+    candidates = [
+        'iframe[name="main-content"]',
+        '#main-content',
+        'iframe[src*="/data_export/"]',
+        'iframe[src*="backend_tasks"]',
+        'iframe[src*="main"]',
+    ]
+    
+    for css in candidates:
+        try:
+            frames = driver.find_elements(By.CSS_SELECTOR, css)
+            if frames:
+                driver.switch_to.frame(frames[0])
+                return True
+        except Exception:
+            pass
+    
+    return False
+
+
+# ========== v2.0 新增: 页面导航函数 ==========
+def navigate_to_first_paid_ltv(driver: Chrome):
+    """进入首充用户LTV页面"""
+    try:
+        # 方式1：点击导航链接
+        click_when_clickable(driver, By.CSS_SELECTOR, FIRST_PAID_LTV_NAV_CSS, timeout=10)
+        time.sleep(2)
+        print("[导航] 已进入首充用户LTV页面")
+    except Exception:
+        # 方式2：直接访问URL（兜底）
+        try:
+            base = driver.current_url.split('/', 3)
+            if len(base) >= 3:
+                root = base[0] + '//' + base[2]
+                driver.get(root + '/data_report/first_paid_ltv')
+                time.sleep(2)
+                print("[导航] 已直接访问首充用户LTV页面")
+        except Exception as e:
+            print(f"[导航] 无法进入首充用户LTV页面: {e}")
+            raise
+
+
+def navigate_to_user_retention(driver: Chrome):
+    """进入用户留存页面"""
+    try:
+        # 方式1：点击导航链接
+        # 注意：可能需要先点击父菜单
+        nav_elements = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/data_report/user_retentions"]')
+        if nav_elements:
+            nav_elements[0].click()
+            time.sleep(2)
+            print("[导航] 已进入用户留存页面")
+        else:
+            # 尝试通过包含"用户留存"文本的元素
+            xpath = '//span[contains(text(),"用户留存")]/parent::a'
+            link = driver.find_element(By.XPATH, xpath)
+            link.click()
+            time.sleep(2)
+            print("[导航] 已进入用户留存页面")
+    except Exception:
+        # 方式2：直接访问URL（兜底）
+        try:
+            base = driver.current_url.split('/', 3)
+            if len(base) >= 3:
+                root = base[0] + '//' + base[2]
+                # 默认访问第一个标签页
+                driver.get(root + '/data_report/user_retentions?user_type=first_login_user')
+                time.sleep(2)
+                print("[导航] 已直接访问用户留存页面")
+        except Exception as e:
+            print(f"[导航] 无法进入用户留存页面: {e}")
+            raise
+
+
+def navigate_to_agent_reports(driver: Chrome):
+    """进入代理报表页面"""
+    try:
+        # 方式1：点击导航链接
+        click_when_clickable(driver, By.CSS_SELECTOR, REPORT_NAV_CSS, timeout=10)
+        time.sleep(2)
+        print("[导航] 已进入代理报表页面")
+    except Exception:
+        # 方式2：直接访问URL
+        try:
+            base = driver.current_url.split('/', 3)
+            if len(base) >= 3:
+                root = base[0] + '//' + base[2]
+                driver.get(root + '/data_export/agent_reports')
+                time.sleep(2)
+                print("[导航] 已直接访问代理报表页面")
+        except Exception as e:
+            print(f"[导航] 无法进入代理报表: {e}")
+            raise
+
+
+# ========== v2.0 新增: 导出操作函数 ==========
+def export_first_paid_ltv(driver: Chrome) -> bool:
+    """导出首充用户LTV数据"""
+    try:
+        # 确保在正确的内容区（可能在iframe中）
+        switch_to_main_content(driver)
+        
+        # 等待页面加载完成
+        time.sleep(2)
+        
+        # 查找"创建导出任务"按钮
+        export_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, FIRST_PAID_LTV_EXPORT_BTN_XPATH))
+        )
+        
+        # 点击导出
+        export_btn.click()
+        print("[导出] 已点击首充用户LTV导出按钮")
+        
+        # 等待任务提交成功
+        time.sleep(2)
+        
+        return True
+        
+    except Exception as e:
+        print(f"[导出] 首充用户LTV导出失败: {e}")
+        return False
+
+
+def export_user_retention_tab(driver: Chrome, user_type: str) -> bool:
+    """
+    导出指定类型的用户留存数据
+    
+    参数:
+        user_type: 用户类型
+            - "first_login_user": 首充用户登录留存
+            - "first_play_user": 首充用户下注留存
+            - "first_pay_user": 首充用户付费留存
+    """
+    try:
+        # 确保在正确的内容区
+        switch_to_main_content(driver)
+        
+        # 步骤1: 切换到对应的标签页
+        tab_xpath = RETENTION_TAB_XPATH_TMPL.format(user_type=user_type)
+        tab = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, tab_xpath))
+        )
+        tab.click()
+        time.sleep(1)
+        print(f"[留存] 已切换到标签: {RETENTION_USER_TYPES[user_type]}")
+        
+        # 步骤2: 点击"昨天"快捷按钮
+        yesterday_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, RETENTION_YESTERDAY_BTN_XPATH))
+        )
+        yesterday_btn.click()
+        time.sleep(1)
+        print(f"[留存] 已选择昨天日期")
+        
+        # 步骤3: 智能点击"全部代理"下拉菜单（多策略fallback）
+        dropdown_clicked = False
+        print(f"[留存-调试] 开始尝试打开代理下拉菜单...")
+        
+        # 策略1: 使用原CSS选择器
+        try:
+            dropdown = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, RETENTION_AGENT_DROPDOWN_CSS))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", dropdown)
+            time.sleep(0.3)
+            dropdown.click()
+            time.sleep(0.5)
+            dropdown_clicked = True
+            print(f"[留存-调试] ✓ 策略1成功: CSS选择器点击")
+        except Exception as e1:
+            print(f"[留存-调试] ✗ 策略1失败: {e1}")
+            
+            # 策略2: 使用XPath查找包含"全部代理"文本的按钮
+            try:
+                dropdown_xpath = '//div[@role="button"]//span[contains(text(), "全部代理")]/parent::div'
+                dropdown = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, dropdown_xpath))
+                )
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", dropdown)
+                time.sleep(0.3)
+                dropdown.click()
+                time.sleep(0.5)
+                dropdown_clicked = True
+                print(f"[留存-调试] ✓ 策略2成功: XPath文本匹配")
+            except Exception as e2:
+                print(f"[留存-调试] ✗ 策略2失败: {e2}")
+                
+                # 策略3: JavaScript强制点击
+                try:
+                    dropdown = driver.find_element(By.CSS_SELECTOR, RETENTION_AGENT_DROPDOWN_CSS)
+                    driver.execute_script("arguments[0].click();", dropdown)
+                    time.sleep(0.5)
+                    dropdown_clicked = True
+                    print(f"[留存-调试] ✓ 策略3成功: JavaScript点击")
+                except Exception as e3:
+                    print(f"[留存-调试] ✗ 策略3失败: {e3}")
+        
+        if not dropdown_clicked:
+            raise Exception("无法打开代理下拉菜单（所有策略均失败）")
+        
+        print(f"[留存] 已打开代理下拉菜单")
+        
+        # 步骤4: 智能点击"全选"按钮（多策略fallback）
+        select_all_clicked = False
+        print(f"[留存-调试] 开始尝试点击全选按钮...")
+        
+        # 策略1: 使用原CSS选择器
+        try:
+            select_all_btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, RETENTION_SELECT_ALL_BTN_CSS))
+            )
+            select_all_btn.click()
+            time.sleep(0.5)
+            select_all_clicked = True
+            print(f"[留存-调试] ✓ 策略1成功: CSS选择器点击")
+        except Exception as e1:
+            print(f"[留存-调试] ✗ 策略1失败: {e1}")
+            
+            # 策略2: 使用XPath查找包含"全选"文本的按钮
+            try:
+                select_all_xpath = '//button[contains(text(), "全选") and @data-action]'
+                select_all_btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, select_all_xpath))
+                )
+                select_all_btn.click()
+                time.sleep(0.5)
+                select_all_clicked = True
+                print(f"[留存-调试] ✓ 策略2成功: XPath文本匹配")
+            except Exception as e2:
+                print(f"[留存-调试] ✗ 策略2失败: {e2}")
+                
+                # 策略3: JavaScript强制点击
+                try:
+                    select_all_btn = driver.find_element(By.CSS_SELECTOR, RETENTION_SELECT_ALL_BTN_CSS)
+                    driver.execute_script("arguments[0].click();", select_all_btn)
+                    time.sleep(0.5)
+                    select_all_clicked = True
+                    print(f"[留存-调试] ✓ 策略3成功: JavaScript点击")
+                except Exception as e3:
+                    print(f"[留存-调试] ✗ 策略3失败: {e3}")
+        
+        if not select_all_clicked:
+            raise Exception("无法点击全选按钮（所有策略均失败）")
+        
+        print(f"[留存] 已全选代理")
+        
+        # ===== 新增步骤: 关闭下拉菜单，避免遮挡导出按钮 =====
+        try:
+            # 方法1: 点击页面空白区域关闭下拉菜单
+            driver.find_element(By.TAG_NAME, 'body').click()
+            time.sleep(0.3)
+            print(f"[留存-调试] 已关闭下拉菜单")
+        except Exception as e:
+            print(f"[留存-调试] 关闭下拉菜单失败: {e}")
+        
+        # 步骤5: 点击"导出"按钮（使用JavaScript避免遮挡问题）
+        export_btn_clicked = False
+        print(f"[留存-调试] 开始尝试点击导出按钮...")
+        
+        # 策略1: 使用JavaScript点击（最可靠）
+        try:
+            export_btn = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, RETENTION_EXPORT_BTN_CSS))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", export_btn)
+            time.sleep(0.3)
+            driver.execute_script("arguments[0].click();", export_btn)
+            export_btn_clicked = True
+            print(f"[留存-调试] ✓ JavaScript点击成功")
+        except Exception as e1:
+            print(f"[留存-调试] ✗ JavaScript点击失败: {e1}")
+            
+            # 策略2: 普通点击
+            try:
+                export_btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, RETENTION_EXPORT_BTN_CSS))
+                )
+                export_btn.click()
+                export_btn_clicked = True
+                print(f"[留存-调试] ✓ 普通点击成功")
+            except Exception as e2:
+                print(f"[留存-调试] ✗ 普通点击失败: {e2}")
+        
+        if not export_btn_clicked:
+            raise Exception("无法点击导出按钮（所有策略均失败）")
+        
+        print(f"[留存] 已点击导出按钮: {RETENTION_USER_TYPES[user_type]}")
+        
+        # ===== 处理浏览器原生Alert确认弹窗 =====
+        try:
+            # 等待Alert出现
+            time.sleep(0.5)
+            alert = WebDriverWait(driver, 5).until(EC.alert_is_present())
+            alert_text = alert.text
+            print(f"[留存-调试] 检测到Alert弹窗: {alert_text}")
+            alert.accept()  # 点击确定
+            print(f"[留存] 已确认Alert弹窗")
+        except Exception as e:
+            print(f"[留存-调试] 未检测到Alert弹窗或已自动关闭: {e}")
+        
+        # 等待任务提交成功
+        time.sleep(2)
+        
+        return True
+        
+    except Exception as e:
+        print(f"[留存] {RETENTION_USER_TYPES.get(user_type, user_type)} 导出失败: {e}")
+        import traceback
+        print(f"[留存-调试] 详细错误追踪:\n{traceback.format_exc()}")
+        return False
+
+
+def export_all_user_retentions(driver: Chrome) -> int:
+    """导出所有3种用户留存数据"""
+    success_count = 0
+    
+    for user_type in ["first_login_user", "first_play_user", "first_pay_user"]:
+        if export_user_retention_tab(driver, user_type):
+            success_count += 1
+        time.sleep(1)  # 每个标签页之间稍作停顿
+    
+    return success_count
+
+
+def click_export_for_date(driver: Chrome, day: str) -> bool:
+    """点击指定日期的导出按钮（在新标签页打开，避免页面跳转）"""
+    # 确保在正确的内容区（尝试切换到iframe）
+    switch_to_main_content(driver)
+    
+    # 等待表格或列表加载
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, '//table|//div[contains(@class,"table")]|//tr'))
+        )
+    except Exception:
+        pass
+    
+    # ===== v2.2 新增：调整页面显示条数为500条/页 =====
+    try:
+        print(f"[导出-调试] 尝试调整页面显示条数为500条/页...")
+        
+        # 查找每页显示条数的下拉菜单
+        size_select = driver.find_element(By.ID, 'size')
+        
+        # 检查当前选中的值
+        current_value = size_select.get_attribute('value')
+        print(f"[导出-调试] 当前显示条数: {current_value}条/页")
+        
+        # 如果不是500条，则调整
+        if current_value != '500':
+            # 使用Select类选择500条选项
+            select = Select(size_select)
+            select.select_by_value('500')
+            print(f"[导出] 已调整为500条/页，等待页面刷新...")
+            
+            # 等待页面刷新（因为onchange会自动提交表单）
+            time.sleep(3)
+            
+            # 再次切换到正确的内容区
+            switch_to_main_content(driver)
+            
+            # 等待表格重新加载
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, '//table|//div[contains(@class,"table")]|//tr'))
+            )
+            print(f"[导出] 页面刷新完成")
+        else:
+            print(f"[导出-调试] 已经是500条/页，无需调整")
+    
+    except Exception as e:
+        print(f"[导出-调试] 调整显示条数失败（可能页面结构不同）: {e}")
+        print(f"[导出-调试] 继续尝试查找导出按钮...")
+    
+    # ===== 原有逻辑：查找并点击导出按钮 =====
+    original = driver.current_window_handle
+    
+    try:
+        # 方式1：精确 href
+        css = EXPORT_BTN_HREF_TMPL.format(day)
+        btns = driver.find_elements(By.CSS_SELECTOR, css)
+        if btns:
+            href = btns[0].get_attribute('href')
+            if href:
+                # 尝试新标签打开
+                windows_before = set(driver.window_handles)
+                driver.execute_script("window.open(arguments[0], '_blank');", href)
+                time.sleep(0.8)
+                windows_after = set(driver.window_handles)
+                new_windows = list(windows_after - windows_before)
+                if new_windows:
+                    driver.switch_to.window(new_windows[0])
+                    driver.close()
+                    driver.switch_to.window(original)
+                else:
+                    # 浏览器阻止了新标签，直接点击并返回
+                    btns[0].click()
+                    time.sleep(1.2)
+                    driver.back()
+                    switch_to_main_content(driver)
+                print(f"[导出] 已触发 {day} 的导出")
+                return True
+    except Exception as e:
+        print(f"[导出] 方式1失败: {e}")
+    
+    try:
+        # 方式2：按行文本匹配日期再取"导出"
+        row_xpath = f'//tr[contains(normalize-space(.), "{day}")]'
+        row = WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.XPATH, row_xpath))
+        )
+        # 在该行内找"导出"链接
+        link = row.find_element(By.XPATH, './/a[contains(text(),"导出") or contains(@href,"export")]')
+        href = link.get_attribute('href')
+        if href:
+            windows_before = set(driver.window_handles)
+            driver.execute_script("window.open(arguments[0], '_blank');", href)
+            time.sleep(0.8)
+            windows_after = set(driver.window_handles)
+            new_windows = list(windows_after - windows_before)
+            if new_windows:
+                driver.switch_to.window(new_windows[0])
+                driver.close()
+                driver.switch_to.window(original)
+            else:
+                link.click()
+                time.sleep(1.2)
+                driver.back()
+                switch_to_main_content(driver)
+            print(f"[导出] 已触发 {day} 的导出（行匹配）")
+            return True
+        else:
+            # 没有 href 的就直接点击
+            link.click()
+            time.sleep(1.2)
+            driver.back()
+            switch_to_main_content(driver)
+            print(f"[导出] 已点击 {day} 的导出按钮")
+            return True
+    except Exception as e:
+        print(f"[导出] 未找到 {day} 的导出按钮: {e}")
+        return False
+
+
+def navigate_to_download_list(driver: Chrome):
+    """进入下载列表页面"""
+    try:
+        # 方式1：点击导航
+        click_when_clickable(driver, By.CSS_SELECTOR, DOWNLOAD_TAB_CSS, timeout=10)
+        time.sleep(2)
+        print("[导航] 已进入下载列表")
+        # 尝试切换到iframe（如果有）
+        switch_to_main_content(driver)
+    except Exception:
+        # 方式2：直接访问
+        try:
+            base = driver.current_url.split('/', 3)
+            if len(base) >= 3:
+                root = base[0] + '//' + base[2]
+                driver.get(root + '/system/backend_tasks')
+                time.sleep(2)
+                print("[导航] 已直接访问下载列表")
+                # 尝试切换到iframe（如果有）
+                switch_to_main_content(driver)
+        except Exception as e:
+            print(f"[导航] 无法进入下载列表: {e}")
+            raise
+
+
+def wait_task_and_download(driver: Chrome, day: str, download_dir: str) -> Optional[str]:
+    """等待任务完成并下载文件"""
+    print(f"[任务] 等待 {day} 的任务完成...")
+    end_time = time.time() + TASK_TIMEOUT_PER_DAY
+    
+    while time.time() < end_time:
+        try:
+            # 查找任务行
+            xpath = TASK_ROW_XPATH_TMPL.format(date=day)
+            rows = driver.find_elements(By.XPATH, xpath)
+            
+            for row in rows:
+                # 检查是否已完成
+                done_badges = row.find_elements(By.XPATH, TASK_DONE_XPATH)
+                if done_badges:
+                    # 找到下载按钮
+                    download_btns = row.find_elements(By.XPATH, TASK_DOWNLOAD_XPATH)
+                    if download_btns:
+                        # 记录下载前的文件列表
+                        before = set(os.listdir(download_dir))
+                        
+                        # 点击下载
+                        download_btns[0].click()
+                        print(f"[下载] 已点击 {day} 的下载按钮，等待文件...")
+                        
+                        # 等待新文件出现
+                        file_path = wait_for_new_download(download_dir, before, timeout=DOWNLOAD_WAIT)
+                        if file_path:
+                            print(f"[下载] 成功下载: {os.path.basename(file_path)}")
+                            return file_path
+                        else:
+                            print(f"[下载] {day} 下载超时")
+                            return None
+            
+            # 未完成，刷新页面继续等待
+            time.sleep(POLL_INTERVAL)
+            driver.refresh()
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"[任务] 检查异常: {e}")
+            time.sleep(POLL_INTERVAL)
+            driver.refresh()
+            time.sleep(2)
+    
+    print(f"[任务] {day} 任务超时未完成")
+    return None
+
+
+def wait_for_new_download(folder: str, before: set, timeout: int = 120) -> Optional[str]:
+    """等待新文件下载完成"""
+    end = time.time() + timeout
+    candidate = None
+    
+    while time.time() < end:
+        try:
+            now = set(os.listdir(folder))
+            new = list(now - before)
+            
+            if new:
+                # 找到最新的文件
+                new_files = [os.path.join(folder, n) for n in new]
+                candidate = max(new_files, key=os.path.getmtime)
+                
+                # 检查是否下载完成（没有 .crdownload 或 .tmp 后缀）
+                if not candidate.endswith(('.crdownload', '.tmp', '.download')):
+                    # 再等一会确保文件稳定
+                    time.sleep(2)
+                    if os.path.exists(candidate):
+                        return candidate
+        except Exception:
+            pass
+        
+        time.sleep(1)
+    
+    return candidate if candidate and os.path.exists(candidate) else None
+
+
+# ========== 文件处理 ==========
+def extract_date_from_csv(csv_path: str) -> Optional[str]:
+    """从CSV文件中提取日期字段"""
+    try:
+        # 尝试读取CSV前几行
+        df = pd.read_csv(csv_path, nrows=5, encoding='utf-8')
+        
+        # 常见的日期列名
+        date_columns = ['日期', 'date', 'Date', '统计日期', '报表日期', 'report_date']
+        
+        for col in date_columns:
+            if col in df.columns:
+                date_val = str(df[col].iloc[0])
+                # 尝试解析日期
+                match = re.search(r'(\d{4}-\d{2}-\d{2})', date_val)
+                if match:
+                    return match.group(1)
+        
+        # 如果没找到，尝试文件名中的日期
+        filename = os.path.basename(csv_path)
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
+        if match:
+            return match.group(1)
+        
+        # 使用今天的日期作为备选
+        return date.today().isoformat()
+        
+    except Exception as e:
+        print(f"[日期提取] 失败: {e}")
+        return date.today().isoformat()
+
+
+def rename_downloaded_file(src_path: str, site: Site) -> str:
+    """重命名下载的文件：产品-平台-地区-部门-日期.csv（原版，保持向后兼容）"""
+    # 从CSV内容提取日期
+    file_date = extract_date_from_csv(src_path)
+    
+    # 构建新文件名
+    new_name = f"{site.product}-{site.platform}-{site.region}-{site.dept}-{file_date}.csv"
+    new_name = sanitize_filename(new_name)
+    
+    new_path = os.path.join(os.path.dirname(src_path), new_name)
+    
+    # 避免覆盖（添加序号）
+    i = 1
+    base = os.path.splitext(new_path)[0]
+    while os.path.exists(new_path):
+        new_path = f"{base}({i}).csv"
+        i += 1
+    
+    # 重命名
+    shutil.move(src_path, new_path)
+    print(f"[重命名] {os.path.basename(src_path)} -> {os.path.basename(new_path)}")
+    
+    return new_path
+
+
+def rename_downloaded_file_v2(src_path: str, site: Site, task_key: str) -> str:
+    """
+    v2.0: 根据任务类型重命名下载的文件
+    
+    参数:
+        src_path: 源文件路径
+        site: 站点信息
+        task_key: 任务标识，如 "first_paid_ltv", "retention_login", "agent_report_2025-10-27"
+    
+    文件命名规则:
+        - LTV: 产品-平台-地区-部门-ltv-日期.csv
+        - 留存: 产品-平台-地区-部门-[留存类型]-日期.csv（如"首充用户登录留存"）
+        - 代理报表: 产品-平台-地区-部门-代理报表-日期.csv
+    """
+    # 从CSV内容提取日期
+    file_date = extract_date_from_csv(src_path)
+    
+    # 根据任务类型构建文件名
+    if task_key == "first_paid_ltv":
+        # LTV命名为"ltv"
+        file_type = "ltv"
+        new_name = f"{site.product}-{site.platform}-{site.region}-{site.dept}-{file_type}-{file_date}.csv"
+    elif task_key == "retention_login":
+        # 留存命名为具体的留存类型
+        file_type = "首充用户登录留存"
+        new_name = f"{site.product}-{site.platform}-{site.region}-{site.dept}-{file_type}-{file_date}.csv"
+    elif task_key == "retention_play":
+        file_type = "首充用户下注留存"
+        new_name = f"{site.product}-{site.platform}-{site.region}-{site.dept}-{file_type}-{file_date}.csv"
+    elif task_key == "retention_pay":
+        file_type = "首充用户付费留存"
+        new_name = f"{site.product}-{site.platform}-{site.region}-{site.dept}-{file_type}-{file_date}.csv"
+    elif task_key.startswith("agent_report_"):
+        # 代理报表命名增加"代理报表"标识
+        file_type = "代理报表"
+        new_name = f"{site.product}-{site.platform}-{site.region}-{site.dept}-{file_type}-{file_date}.csv"
+    else:
+        # 未知类型，使用默认命名
+        new_name = f"{site.product}-{site.platform}-{site.region}-{site.dept}-{task_key}-{file_date}.csv"
+    
+    new_name = sanitize_filename(new_name)
+    new_path = os.path.join(os.path.dirname(src_path), new_name)
+    
+    # 避免覆盖（添加序号）
+    i = 1
+    base = os.path.splitext(new_path)[0]
+    while os.path.exists(new_path):
+        new_path = f"{base}({i}).csv"
+        i += 1
+    
+    # 重命名
+    shutil.move(src_path, new_path)
+    print(f"[重命名] {os.path.basename(src_path)} -> {os.path.basename(new_path)}")
+    
+    return new_path
+
+
+# ========== 主流程 ==========
+def export_all_sites(site: Site, mode: str = "current", target_date: str = None):
+    """
+    第一阶段：导出站点数据（v2.2版本 - 支持双模式）
+    
+    参数:
+        site: 站点信息
+        mode: 模式选择
+            - "current": 当前模式，导出LTV+留存+代理报表（共5个文件）
+            - "history": 历史模式，只导出代理报表（1个文件）
+        target_date: 目标日期（格式：YYYY-MM-DD）
+            - mode="current"时：使用昨天日期（忽略此参数）
+            - mode="history"时：使用指定日期
+    
+    返回: 成功导出的总数量
+    """
+    if mode == "history":
+        print(f"\n{'='*80}")
+        print(f"[历史模式] 站点: {site.platform} | 日期: {target_date}")
+        print(f"账号: {site.username} | 地区: {site.region} | 部门: {site.dept}")
+        print(f"{'='*80}\n")
+    else:
+        print(f"\n{'='*80}")
+        print(f"[导出阶段] {site.product}-{site.platform}-{site.region}-{site.dept}")
+        print(f"URL: {site.url}")
+        print(f"账号: {site.username}")
+        print(f"{'='*80}\n")
+    
+    # 设置下载目录（虽然这阶段不下载，但setup_driver需要）
+    download_dir = os.path.join(DOWNLOADS_ROOT, site.platform)
+    ensure_dirs(download_dir)
+    
+    # 为每个站点创建独立的浏览器实例
+    driver = setup_driver(download_dir)
+    
+    try:
+        # 登录
+        smart_login(driver, site)
+        
+        export_count = 0
+        
+        # 根据模式决定导出内容
+        if mode == "history":
+            # ===== 历史模式：只导出代理报表 =====
+            print(f"\n{'='*60}")
+            print(f"历史模式: 导出 {target_date} 的代理报表")
+            print(f"{'='*60}")
+            try:
+                navigate_to_agent_reports(driver)
+                if click_export_for_date(driver, target_date):
+                    export_count += 1
+                    print(f"[✓] {target_date}")
+                else:
+                    print(f"[✗] {target_date} 导出失败")
+            except Exception as e:
+                print(f"[✗] 代理报表异常: {e}")
+        
+        else:  # mode == "current"
+            # ===== 当前模式：导出5个文件（原有逻辑） =====
+            
+            # ===== 步骤1: 导出首充用户LTV =====
+            print(f"\n{'='*60}")
+            print("步骤1/3: 导出首充用户LTV")
+            print(f"{'='*60}")
+            try:
+                navigate_to_first_paid_ltv(driver)
+                if export_first_paid_ltv(driver):
+                    export_count += 1
+                    print("[✓] 首充用户LTV导出成功")
+                else:
+                    print("[✗] 首充用户LTV导出失败")
+            except Exception as e:
+                print(f"[✗] 首充用户LTV异常: {e}")
+            
+            time.sleep(2)
+            
+            # ===== 步骤2: 导出用户留存（3个） =====
+            print(f"\n{'='*60}")
+            print("步骤2/3: 导出用户留存 (3个类型)")
+            print(f"{'='*60}")
+            try:
+                navigate_to_user_retention(driver)
+                retention_count = export_all_user_retentions(driver)
+                export_count += retention_count
+                print(f"[✓] 用户留存导出: {retention_count}/3 成功")
+            except Exception as e:
+                print(f"[✗] 用户留存异常: {e}")
+            
+            time.sleep(2)
+            
+            # ===== 步骤3: 导出代理报表（昨天数据） =====
+            print(f"\n{'='*60}")
+            print("步骤3/3: 导出代理报表（昨天数据）")
+            print(f"{'='*60}")
+            try:
+                navigate_to_agent_reports(driver)
+                dates = date_list(LAST_N_DAYS)  # LAST_N_DAYS=1，导出昨天
+                for day in dates:
+                    if click_export_for_date(driver, day):
+                        export_count += 1
+                        print(f"[✓] {day}")
+                    time.sleep(1)
+            except Exception as e:
+                print(f"[✗] 代理报表异常: {e}")
+        
+        print(f"\n[导出] {site.platform}: 总计成功导出 {export_count} 个任务")
+        return export_count
+        
+    except Exception as e:
+        print(f"\n[导出异常] {site.platform}: {e}")
+        traceback.print_exc()
+        return 0
+    
+    finally:
+        # 关闭浏览器
+        try:
+            driver.quit()
+            print(f"[浏览器] 已关闭\n")
+        except Exception:
+            pass
+
+
+def check_and_download_site(site: Site, expected_tasks: list) -> tuple[int, list]:
+    """
+    检查站点任务状态并下载已完成的文件（v2.0支持多任务类型）
+    
+    参数:
+        site: 站点信息
+        expected_tasks: 期望的任务列表，例如:
+            ["first_paid_ltv", "retention_login", "retention_play", 
+             "retention_pay", "agent_report_2025-10-27"]
+    
+    返回:
+        (已下载数量, 剩余未完成的任务列表)
+    """
+    download_dir = os.path.join(DOWNLOADS_ROOT, site.platform)
+    ensure_dirs(download_dir)
+    
+    driver = setup_driver(download_dir)
+    
+    try:
+        # 登录
+        smart_login(driver, site)
+        
+        # 进入下载列表
+        navigate_to_download_list(driver)
+        
+        # 获取页面上所有任务行
+        time.sleep(2)
+        all_rows = driver.find_elements(By.XPATH, '//tr')
+        
+        # 智能匹配任务（v2.1 改进版：支持留存任务批量匹配）
+        completed_tasks = []
+        task_row_map = {}  # {task_key: row_element}
+        retention_rows = []  # 存储所有已完成的留存任务行
+        
+        # 第一步：收集所有留存任务（因为后台不区分具体类型）
+        retention_task_keys = [k for k in expected_tasks if k.startswith("retention_")]
+        if retention_task_keys:
+            pattern = TASK_PATTERNS["retention"]
+            for row in all_rows:
+                try:
+                    row_text = row.text
+                    if re.search(pattern, row_text):
+                        # 检查是否已完成
+                        done_badges = row.find_elements(By.XPATH, TASK_DONE_XPATH)
+                        if done_badges:
+                            retention_rows.append(row)
+                except Exception:
+                    pass
+            print(f"[下载-调试] 找到 {len(retention_rows)} 个已完成的用户留存任务")
+        
+        # 第二步：按导出顺序将留存任务分配给对应的task_key
+        # 导出顺序：retention_login -> retention_play -> retention_pay
+        retention_order = ["retention_login", "retention_play", "retention_pay"]
+        for idx, task_key in enumerate(retention_order):
+            if task_key in expected_tasks and idx < len(retention_rows):
+                completed_tasks.append(task_key)
+                task_row_map[task_key] = retention_rows[idx]
+                print(f"[下载-调试] {task_key} 匹配到第 {idx+1} 个留存任务")
+        
+        # 第三步：匹配其他任务（LTV、代理报表）
+        for task_key in expected_tasks:
+            if task_key.startswith("retention_"):
+                continue  # 留存任务已处理，跳过
+            
+            # 确定任务类型和匹配模式
+            if task_key == "first_paid_ltv":
+                pattern = TASK_PATTERNS["first_paid_ltv"]
+            elif task_key.startswith("agent_report_"):
+                pattern = TASK_PATTERNS["agent_report"]
+            else:
+                continue
+            
+            # 在所有行中查找匹配的任务
+            for row in all_rows:
+                try:
+                    row_text = row.text
+                    if re.search(pattern, row_text):
+                        # 检查是否已完成
+                        done_badges = row.find_elements(By.XPATH, TASK_DONE_XPATH)
+                        if done_badges:
+                            completed_tasks.append(task_key)
+                            task_row_map[task_key] = row
+                            print(f"[下载-调试] {task_key} 匹配成功")
+                        break
+                except Exception:
+                    pass
+        
+        # 下载已完成的文件
+        success_count = 0
+        for task_key in completed_tasks:
+            try:
+                row = task_row_map[task_key]
+                download_btns = row.find_elements(By.XPATH, TASK_DOWNLOAD_XPATH)
+                
+                if download_btns:
+                    before = set(os.listdir(download_dir))
+                    download_btns[0].click()
+                    time.sleep(2)
+                    
+                    file_path = wait_for_new_download(download_dir, before, timeout=DOWNLOAD_WAIT)
+                    
+                    if file_path:
+                        # 根据任务类型重命名
+                        renamed_path = rename_downloaded_file_v2(file_path, site, task_key)
+                        print(f"  ✓ {task_key}")
+                        success_count += 1
+                else:
+                    print(f"  ✗ {task_key} 无下载按钮")
+                    
+            except Exception as e:
+                print(f"  ✗ {task_key} 下载失败: {e}")
+        
+        # 返回：已下载数量 + 还未完成的任务
+        still_pending = [t for t in expected_tasks if t not in completed_tasks]
+        return success_count, still_pending
+        
+    except Exception as e:
+        print(f"  异常: {e}")
+        return 0, expected_tasks  # 出错了，全部任务当作未完成
+    
+    finally:
+        # 关闭浏览器
+        try:
+            driver.quit()
+            print(f"[浏览器] 已关闭\n")
+        except Exception:
+            pass
+
+
+def cleanup_chrome_processes():
+    """清理可能残留的Chrome进程"""
+    try:
+        import subprocess
+        if sys.platform == 'win32':
+            # Windows系统
+            subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe', '/T'], 
+                         capture_output=True, timeout=5)
+            subprocess.run(['taskkill', '/F', '/IM', 'chromedriver.exe', '/T'], 
+                         capture_output=True, timeout=5)
+        else:
+            # Linux/Mac系统
+            subprocess.run(['pkill', '-9', 'chrome'], 
+                         capture_output=True, timeout=5)
+            subprocess.run(['pkill', '-9', 'chromedriver'], 
+                         capture_output=True, timeout=5)
+        time.sleep(2)
+    except Exception:
+        pass  # 忽略清理失败
+
+
+def main():
+    """主函数"""
+    print("="*80)
+    print("代理日报表自动下载爬虫 v2.2")
+    print("="*80)
+    
+    # 清理可能残留的Chrome进程
+    print("正在检查Chrome进程...")
+    cleanup_chrome_processes()
+    
+    # 检查配置文件
+    csv_path = 'sites.csv'
+    if not os.path.exists(csv_path):
+        print(f"错误: 未找到配置文件 {csv_path}")
+        print("请先创建 sites.csv 文件，参考 README.md")
+        sys.exit(1)
+    
+    # 读取站点列表
+    try:
+        sites = read_sites(csv_path)
+        print(f"已加载 {len(sites)} 个站点配置\n")
+    except Exception as e:
+        print(f"错误: 读取配置文件失败: {e}")
+        sys.exit(1)
+    
+    # 按配置过滤站点范围（TEST_FIRST_N_SITES / ONLY_PLATFORMS / EXCLUDE_PLATFORMS）
+    if ONLY_PLATFORMS:
+        allow = set(ONLY_PLATFORMS)
+        sites = [s for s in sites if s.platform in allow]
+        print(f"按平台白名单过滤后站点数: {len(sites)} ({', '.join(allow)})")
+    if EXCLUDE_PLATFORMS:
+        deny = set(EXCLUDE_PLATFORMS)
+        sites = [s for s in sites if s.platform not in deny]
+        print(f"按平台黑名单过滤后站点数: {len(sites)} (排除: {', '.join(deny)})")
+    if TEST_FIRST_N_SITES and TEST_FIRST_N_SITES > 0:
+        sites = sites[:TEST_FIRST_N_SITES]
+        print(f"仅测试前 {TEST_FIRST_N_SITES} 个站点")
+    
+    # 创建下载目录
+    ensure_dirs(DOWNLOADS_ROOT)
+    
+    try:
+        # ========== 第一轮：批量导出所有网站 ==========
+        print("\n" + "="*80)
+        print("第一轮：批量导出所有网站")
+        print("="*80)
+        
+        export_results = {}
+        history_export_results = {}
+        
+        # v2.2: 如果启用历史模式，先爬历史数据
+        if ENABLE_HISTORY_MODE:
+            print("\n" + "="*60)
+            print("历史数据补齐模式（只爬代理报表）")
+            print(f"日期范围: {HISTORY_START_DATE} 至 {HISTORY_END_DATE}")
+            print("="*60)
+            
+            # 生成日期列表
+            from datetime import datetime
+            start = datetime.strptime(HISTORY_START_DATE, "%Y-%m-%d")
+            end = datetime.strptime(HISTORY_END_DATE, "%Y-%m-%d")
+            history_dates = []
+            current = start
+            while current <= end:
+                history_dates.append(current.strftime("%Y-%m-%d"))
+                current += timedelta(days=1)
+            
+            print(f"需要爬取 {len(history_dates)} 天的历史数据")
+            
+            # 遍历所有日期和站点
+            for date_str in history_dates:
+                print(f"\n{'='*60}")
+                print(f"历史日期: {date_str}")
+                print(f"{'='*60}")
+                
+                for i, site in enumerate(sites, 1):
+                    print(f"\n[历史导出] {i}/{len(sites)} - {site.platform} - {date_str}")
+                    count = export_all_sites(site, mode="history", target_date=date_str)
+                    key = f"{site.platform}_{date_str}"
+                    history_export_results[key] = count
+                    
+                    if i < len(sites):
+                        time.sleep(2)
+                
+                time.sleep(3)  # 每个日期之间稍作停顿
+            
+            print("\n" + "="*60)
+            print("历史数据导出完成！")
+            print(f"成功: {sum(1 for c in history_export_results.values() if c > 0)}/{len(history_dates) * len(sites)}")
+            print("="*60)
+            
+            # 立即下载历史数据
+            print("\n" + "="*60)
+            print("开始下载历史数据...")
+            print("="*60)
+            time.sleep(5)  # 等待任务开始处理
+            
+            history_download_results = {}
+            for date_str in history_dates:
+                print(f"\n[历史下载] 日期: {date_str}")
+                
+                # 为每个日期构建期望任务
+                history_expected_tasks = [f"agent_report_{date_str}"]
+                
+                # 下载该日期的所有站点数据
+                for site in sites:
+                    try:
+                        downloaded_count, still_pending = check_and_download_site(site, history_expected_tasks)
+                        if downloaded_count > 0:
+                            print(f"[✓] {site.platform}: 下载 {downloaded_count} 个文件")
+                            key = f"{site.platform}_{date_str}"
+                            history_download_results[key] = downloaded_count
+                        elif still_pending:
+                            print(f"[⚠] {site.platform}: {len(still_pending)} 个任务未完成")
+                    except Exception as e:
+                        print(f"[✗] {site.platform} 下载失败: {e}")
+                    
+                    time.sleep(1)
+                
+                time.sleep(2)  # 每个日期之间稍作停顿
+            
+            print("\n" + "="*60)
+            print("历史数据下载完成！")
+            print(f"成功下载: {sum(history_download_results.values())} 个文件")
+            print("="*60)
+        
+        # 当前模式：爬昨天的全部数据（5个文件）
+        print("\n" + "="*60)
+        print("当前模式：爬取昨天的全部数据（LTV + 留存 + 代理报表）")
+        print("="*60)
+        
+        for i, site in enumerate(sites, 1):
+            print(f"\n[当前导出] {i}/{len(sites)}")
+            count = export_all_sites(site, mode="current")
+            export_results[site.platform] = count
+            
+            if i < len(sites):
+                time.sleep(3)
+        
+        print("\n" + "="*80)
+        print("第一轮完成！所有导出任务已提交")
+        print(f"成功站点: {sum(1 for c in export_results.values() if c > 0)}/{len(sites)}")
+        print("="*80)
+        
+        # 直接进入下载阶段（不等待）
+        print("\n立即开始下载阶段...")
+        print("注意：如果任务还未完成，下载阶段会自动等待")
+        time.sleep(2)
+        
+        # ========== 第二轮：批量下载所有网站（轮询模式 v2.2） ==========
+        print("\n" + "="*80)
+        print("第二轮：批量下载所有网站（轮询模式 v2.2）")
+        print("="*80)
+        
+        # v2.2: 构建期望任务列表（根据模式动态调整）
+        yesterday = date_list(LAST_N_DAYS)[0]  # 获取昨天的日期
+        expected_tasks = [
+            "first_paid_ltv",           # 首充用户LTV
+            "retention_login",          # 首充用户登录留存
+            "retention_play",           # 首充用户下注留存
+            "retention_pay",            # 首充用户付费留存
+            f"agent_report_{yesterday}" # 代理报表
+        ]
+        
+        download_results = {}
+        
+        # 记录每个站点还未完成的任务
+        pending_sites = {i: {'site': site, 'pending_tasks': expected_tasks.copy()} 
+                        for i, site in enumerate(sites)}
+        
+        # v2.0: 使用全局配置参数
+        for round_num in range(1, MAX_ROUNDS + 1):
+            if not pending_sites:
+                print("\n✓ 所有站点都已完成！")
+                break
+            
+            print(f"\n{'='*60}")
+            print(f"第 {round_num} 轮检查（剩余 {len(pending_sites)} 个站点）")
+            print(f"{'='*60}")
+            
+            completed_in_round = []
+            
+            for site_id, info in list(pending_sites.items()):
+                site = info['site']
+                pending_tasks = info['pending_tasks']
+                
+                print(f"\n[检查] {site.platform} (剩余 {len(pending_tasks)} 个任务)")
+                
+                # 检查并下载该站点
+                downloaded_count, still_pending = check_and_download_site(site, pending_tasks)
+                
+                if downloaded_count > 0:
+                    print(f"[下载] {site.platform}: 本轮下载 {downloaded_count} 个文件")
+                    download_results[site.platform] = download_results.get(site.platform, 0) + downloaded_count
+                
+                # 更新待处理任务
+                if still_pending:
+                    pending_sites[site_id]['pending_tasks'] = still_pending
+                    print(f"[等待] {site.platform}: 还有 {len(still_pending)} 个任务未完成")
+                else:
+                    completed_in_round.append(site_id)
+                    print(f"[完成] {site.platform}: 全部文件已下载")
+                
+                time.sleep(2)  # 站点间短暂休息
+            
+            # 移除已完成的站点
+            for site_id in completed_in_round:
+                del pending_sites[site_id]
+            
+            # 如果还有未完成的站点，等待后进入下一轮
+            if pending_sites and round_num < MAX_ROUNDS:
+                print(f"\n等待 {ROUND_INTERVAL} 秒后进入第 {round_num + 1} 轮...")
+                time.sleep(ROUND_INTERVAL)
+        
+        # 显示最终结果
+        if pending_sites:
+            print(f"\n⚠ 还有 {len(pending_sites)} 个站点未完全完成（已达最大轮询次数）")
+            for info in pending_sites.values():
+                print(f"  - {info['site'].platform}: 剩余 {len(info['pending_tasks'])} 个任务")
+        
+        print("\n" + "="*80)
+        print("🎉 所有站点处理完成！")
+        print(f"📁 下载文件保存在: {os.path.abspath(DOWNLOADS_ROOT)}")
+        print(f"📊 导出成功: {sum(1 for c in export_results.values() if c > 0)}/{len(sites)} 个站点")
+        print(f"📊 下载成功: {sum(1 for c in download_results.values() if c > 0)}/{len(sites)} 个站点")
+        print("="*80)
+        
+    except KeyboardInterrupt:
+        print("\n\n用户中断程序")
+    
+    except Exception as e:
+        print(f"\n程序异常: {e}")
+        traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()
+
