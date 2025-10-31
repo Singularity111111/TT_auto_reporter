@@ -43,7 +43,7 @@ ROUND_INTERVAL = 3                   # 轮询间隔秒数（每轮之间等待�
 
 # ========== 运行范围控制（新增） ==========
 # 仅测试前 N 个站点。设置为 None/0 表示全部站点
-TEST_FIRST_N_SITES: int | None = 1  # 改为None，跑所有站点
+TEST_FIRST_N_SITES: int | None = None  # 改为None，跑所有站点
 
 # 只跑指定平台（逗号分隔）。为空列表表示不过滤
 # 例如：ONLY_PLATFORMS = ["OK7", "58", "AI7"]
@@ -54,13 +54,30 @@ ONLY_PLATFORMS: list[str] = []
 EXCLUDE_PLATFORMS: list[str] = ["bra1"]
 
 # ========== 历史数据补齐配置（v2.2新增） ==========
-ENABLE_HISTORY_MODE = True          # 是否启用历史数据补齐模式
+ENABLE_HISTORY_MODE = False          # 是否启用历史数据补齐模式
 HISTORY_START_DATE = "2025-10-01"    # 历史数据起始日期（包含，格式：YYYY-MM-DD）
-HISTORY_END_DATE = "2025-10-02"      # 历史数据结束日期（包含，格式：YYYY-MM-DD）
+HISTORY_END_DATE = "2025-10-27"      # 历史数据结束日期（包含，格式：YYYY-MM-DD）
 # 重要说明：
 # - 历史模式下只爬取代理报表，不爬取LTV和留存数据
 # - 历史模式会先执行，然后再执行当前模式（爬昨天的全部数据）
 # - 设置 ENABLE_HISTORY_MODE = False 可关闭历史补齐功能
+
+# ========== 文件覆盖配置（v2.3新增） ==========
+OVERWRITE_EXISTING_FILES = True     # True=覆盖同名文件, False=添加序号保留
+# 说明：
+# - True：覆盖同名文件，保持文件夹整洁，自动更新为最新数据
+# - False（当前）：添加序号(1)(2)(3)，保留所有历史版本，防止文件丢失
+# ⚠️ v2.4: 临时禁用覆盖，修复代理报表日期提取问题后可改回True
+
+# ========== 运行模式配置（v2.4新增） ==========
+RUN_MODE = "full"  # 运行模式选择
+# 可选值：
+#   - "full": 完整流程（导出+下载）
+#   - "export_only": 只导出，不下载
+#   - "download_only": 只下载，不导出
+# 使用场景：
+#   - 先运行导出，检查无误后再单独运行下载
+#   - 或者跳过导出直接下载已有的任务
 
 # ========== 选择器配置 ==========
 # 导航选择器
@@ -91,6 +108,8 @@ RETENTION_USER_TYPES = {
 }
 # 昨天快捷按钮
 RETENTION_YESTERDAY_BTN_XPATH = '//a[contains(@class,"btn") and contains(@class,"btn-outline") and contains(@href,"start_time") and contains(text(),"昨天")]'
+# 最近30天快捷按钮
+RETENTION_LAST_30_DAYS_BTN_XPATH = '//a[contains(@class,"btn") and contains(@class,"btn-outline") and contains(text(),"最近30天")]'
 # 全部代理下拉菜单
 RETENTION_AGENT_DROPDOWN_CSS = 'div[data-channel-selector-target="agentSelectedText"]'
 # 全选按钮
@@ -561,13 +580,13 @@ def export_user_retention_tab(driver: Chrome, user_type: str) -> bool:
         time.sleep(1)
         print(f"[留存] 已切换到标签: {RETENTION_USER_TYPES[user_type]}")
         
-        # 步骤2: 点击"昨天"快捷按钮
-        yesterday_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, RETENTION_YESTERDAY_BTN_XPATH))
+        # 步骤2: 点击"最近30天"快捷按钮
+        last_30_days_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, RETENTION_LAST_30_DAYS_BTN_XPATH))
         )
-        yesterday_btn.click()
+        last_30_days_btn.click()
         time.sleep(1)
-        print(f"[留存] 已选择昨天日期")
+        print(f"[留存] 已选择最近30天日期")
         
         # 步骤3: 智能点击"全部代理"下拉菜单（多策略fallback）
         dropdown_clicked = False
@@ -739,6 +758,72 @@ def export_all_user_retentions(driver: Chrome) -> int:
     return success_count
 
 
+def get_available_dates_from_page(driver: Chrome) -> List[str]:
+    """
+    从代理报表页面获取所有可用的日期列表（v2.4新增）
+    
+    返回: 可用的日期列表，格式为 ['2025-10-01', '2025-10-02', ...]
+    """
+    try:
+        switch_to_main_content(driver)
+        
+        # 等待表格加载
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, '//table|//tr'))
+        )
+        
+        # 调整为500条/页（复用click_export_for_date中的多策略逻辑）
+        size_select = None
+        try:
+            size_select = driver.find_element(By.ID, 'size')
+        except:
+            try:
+                size_select = driver.find_element(By.NAME, 'size')
+            except:
+                try:
+                    size_select = driver.find_element(By.CSS_SELECTOR, 'select.select-xs')
+                except:
+                    try:
+                        size_select = driver.find_element(By.XPATH, '//select[.//option[contains(text(),"条/页")]]')
+                    except:
+                        pass
+        
+        if size_select and size_select.get_attribute('value') != '500':
+            try:
+                select = Select(size_select)
+                select.select_by_value('500')
+                time.sleep(3)
+                switch_to_main_content(driver)
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, '//table|//tr'))
+                )
+            except:
+                pass
+        
+        # 查找所有行中的日期
+        available_dates = []
+        rows = driver.find_elements(By.XPATH, '//tr')
+        
+        for row in rows:
+            try:
+                row_text = row.text
+                # 匹配日期格式 YYYY-MM-DD
+                match = re.search(r'(\d{4}-\d{2}-\d{2})', row_text)
+                if match:
+                    date_str = match.group(1)
+                    if date_str not in available_dates:
+                        available_dates.append(date_str)
+            except Exception:
+                continue
+        
+        print(f"[识别] 找到 {len(available_dates)} 个可用日期")
+        return sorted(available_dates)
+        
+    except Exception as e:
+        print(f"[识别] 获取可用日期失败: {e}")
+        return []
+
+
 def click_export_for_date(driver: Chrome, day: str) -> bool:
     """点击指定日期的导出按钮（在新标签页打开，避免页面跳转）"""
     # 确保在正确的内容区（尝试切换到iframe）
@@ -752,40 +837,71 @@ def click_export_for_date(driver: Chrome, day: str) -> bool:
     except Exception:
         pass
     
-    # ===== v2.2 新增：调整页面显示条数为500条/页 =====
+    # ===== v2.3 增强：调整页面显示条数为500条/页（多策略） =====
     try:
         print(f"[导出-调试] 尝试调整页面显示条数为500条/页...")
         
-        # 查找每页显示条数的下拉菜单
-        size_select = driver.find_element(By.ID, 'size')
+        # 多策略查找select元素
+        size_select = None
         
-        # 检查当前选中的值
-        current_value = size_select.get_attribute('value')
-        print(f"[导出-调试] 当前显示条数: {current_value}条/页")
+        # 策略1: 通过ID查找
+        try:
+            size_select = driver.find_element(By.ID, 'size')
+            print(f"[导出-调试] ✓ 策略1成功: 通过ID找到select元素")
+        except Exception as e1:
+            print(f"[导出-调试] ✗ 策略1失败: ID查找失败")
+            
+            # 策略2: 通过name属性查找
+            try:
+                size_select = driver.find_element(By.NAME, 'size')
+                print(f"[导出-调试] ✓ 策略2成功: 通过name找到select元素")
+            except Exception as e2:
+                print(f"[导出-调试] ✗ 策略2失败: name查找失败")
+                
+                # 策略3: 通过class查找（更通用）
+                try:
+                    size_select = driver.find_element(By.CSS_SELECTOR, 'select.select-xs')
+                    print(f"[导出-调试] ✓ 策略3成功: 通过class找到select元素")
+                except Exception as e3:
+                    print(f"[导出-调试] ✗ 策略3失败: class查找失败")
+                    
+                    # 策略4: 通过XPath查找包含"条/页"选项的select
+                    try:
+                        size_select = driver.find_element(By.XPATH, '//select[.//option[contains(text(),"条/页")]]')
+                        print(f"[导出-调试] ✓ 策略4成功: 通过XPath找到select元素")
+                    except Exception as e4:
+                        print(f"[导出-调试] ✗ 策略4失败: XPath查找失败")
         
-        # 如果不是500条，则调整
-        if current_value != '500':
-            # 使用Select类选择500条选项
-            select = Select(size_select)
-            select.select_by_value('500')
-            print(f"[导出] 已调整为500条/页，等待页面刷新...")
+        if size_select:
+            # 检查当前选中的值
+            current_value = size_select.get_attribute('value')
+            print(f"[导出-调试] 当前显示条数: {current_value}条/页")
             
-            # 等待页面刷新（因为onchange会自动提交表单）
-            time.sleep(3)
-            
-            # 再次切换到正确的内容区
-            switch_to_main_content(driver)
-            
-            # 等待表格重新加载
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, '//table|//div[contains(@class,"table")]|//tr'))
-            )
-            print(f"[导出] 页面刷新完成")
+            # 如果不是500条，则调整
+            if current_value != '500':
+                # 使用Select类选择500条选项
+                select = Select(size_select)
+                select.select_by_value('500')
+                print(f"[导出] 已调整为500条/页，等待页面刷新...")
+                
+                # 等待页面刷新（因为onchange会自动提交表单）
+                time.sleep(3)
+                
+                # 再次切换到正确的内容区
+                switch_to_main_content(driver)
+                
+                # 等待表格重新加载
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, '//table|//div[contains(@class,"table")]|//tr'))
+                )
+                print(f"[导出] 页面刷新完成")
+            else:
+                print(f"[导出-调试] 已经是500条/页，无需调整")
         else:
-            print(f"[导出-调试] 已经是500条/页，无需调整")
+            print(f"[导出-警告] ⚠ 未找到页面显示条数选择器，将尝试直接查找（可能受分页影响）")
     
     except Exception as e:
-        print(f"[导出-调试] 调整显示条数失败（可能页面结构不同）: {e}")
+        print(f"[导出-警告] ⚠ 调整显示条数失败: {e}")
         print(f"[导出-调试] 继续尝试查找导出按钮...")
     
     # ===== 原有逻辑：查找并点击导出按钮 =====
@@ -859,28 +975,49 @@ def click_export_for_date(driver: Chrome, day: str) -> bool:
 
 
 def navigate_to_download_list(driver: Chrome):
-    """进入下载列表页面"""
-    try:
-        # 方式1：点击导航
-        click_when_clickable(driver, By.CSS_SELECTOR, DOWNLOAD_TAB_CSS, timeout=10)
-        time.sleep(2)
-        print("[导航] 已进入下载列表")
-        # 尝试切换到iframe（如果有）
-        switch_to_main_content(driver)
-    except Exception:
-        # 方式2：直接访问
+    """进入下载列表页面（增强版：多候选URL尝试）"""
+    # 提取根URL
+    base = driver.current_url.split('/', 3)
+    if len(base) < 3:
+        print(f"[导航] 无法从当前URL提取根地址: {driver.current_url}")
+        return
+    
+    root = base[0] + '//' + base[2]
+    
+    # 候选URL列表（优先级从高到低）
+    candidate_urls = [
+        '/system/backend_tasks',
+        '/backend_tasks',
+        '/admin/backend_tasks',
+        '/system/tasks',
+        '/data_export/backend_tasks',
+        '/dashboard',  # 作为最后兜底
+    ]
+    
+    # 尝试每个候选URL
+    for url_path in candidate_urls:
         try:
-            base = driver.current_url.split('/', 3)
-            if len(base) >= 3:
-                root = base[0] + '//' + base[2]
-                driver.get(root + '/system/backend_tasks')
-                time.sleep(2)
-                print("[导航] 已直接访问下载列表")
+            full_url = root + url_path
+            print(f"[导航] 尝试访问: {full_url}")
+            driver.get(full_url)
+            time.sleep(2)
+            
+            # 检查页面是否包含"下载"或"后台任务"等关键字（验证是否到了正确页面）
+            page_text = driver.page_source
+            if any(keyword in page_text for keyword in ['下载', 'download', '后台任务', 'backend_task', '导出任务']):
+                print(f"[导航] ✓ 成功进入下载列表: {url_path}")
                 # 尝试切换到iframe（如果有）
                 switch_to_main_content(driver)
+                return
+            else:
+                print(f"[导航] ✗ 页面不包含下载相关内容，继续尝试...")
         except Exception as e:
-            print(f"[导航] 无法进入下载列表: {e}")
-            raise
+            print(f"[导航] ✗ 访问 {url_path} 失败: {e}")
+            continue
+    
+    # 如果所有候选都失败，打印警告
+    print(f"[导航] ⚠️ 警告：所有候选URL都无法进入下载列表，将使用当前页面")
+    print(f"[导航] 当前URL: {driver.current_url}")
 
 
 def wait_task_and_download(driver: Chrome, day: str, download_dir: str) -> Optional[str]:
@@ -963,34 +1100,101 @@ def wait_for_new_download(folder: str, before: set, timeout: int = 120) -> Optio
 
 # ========== 文件处理 ==========
 def extract_date_from_csv(csv_path: str) -> Optional[str]:
-    """从CSV文件中提取日期字段"""
+    """从CSV文件中提取最新日期（优先CSV内容，失败时使用文件名）"""
+    filename = os.path.basename(csv_path)
+    print(f"[日期提取] 处理文件: {filename}")
+    
+    # ===== 方法1：从CSV内容提取最新日期（优先） =====
+    encodings = ['utf-8', 'gbk', 'gb2312', 'latin1', 'utf-8-sig']
+    
+    for encoding in encodings:
+        try:
+            # 读取整个CSV文件以获取总行数
+            df = pd.read_csv(csv_path, encoding=encoding)
+            total_rows = len(df)
+            print(f"[日期提取] 成功读取CSV，编码: {encoding}，总行数: {total_rows}，列: {list(df.columns)[:5]}")
+            
+            # 常见的日期列名（按优先级）
+            date_columns = ['日期', 'date', 'Date', 'DATE', '统计日期', '报表日期', 'report_date', 'stat_date']
+            
+            for col in date_columns:
+                if col in df.columns:
+                    # 只从第一行和最后一行提取日期（性能优化）
+                    dates = []
+                    
+                    # 第一行
+                    if total_rows > 0:
+                        date_val = str(df[col].iloc[0])
+                        match = re.search(r'(\d{4}-\d{2}-\d{2})', date_val)
+                        if match:
+                            dates.append(match.group(1))
+                    
+                    # 最后一行（如果与第一行不同）
+                    if total_rows > 1:
+                        date_val = str(df[col].iloc[-1])
+                        match = re.search(r'(\d{4}-\d{2}-\d{2})', date_val)
+                        if match:
+                            dates.append(match.group(1))
+                    
+                    if dates:
+                        # 返回最新（最大）的日期
+                        latest_date = max(dates)
+                        print(f"[日期提取] ✓ 从CSV内容提取最新日期: {latest_date} (列: {col}, 检查了第1行和第{total_rows}行)")
+                        return latest_date
+            
+            # 成功读取但没找到日期列
+            print(f"[日期提取] ✗ CSV中未找到日期列，尝试文件名...")
+            break
+            
+        except UnicodeDecodeError:
+            continue  # 尝试下一个编码
+        except Exception as e:
+            print(f"[日期提取] ✗ 读取失败 ({encoding}): {e}")
+            if encoding == encodings[-1]:
+                print(f"[日期提取] ✗ 所有编码尝试失败，尝试文件名...")
+            continue
+    
+    # ===== 方法2：从原始文件名提取（回退） =====
+    # 注意：优先从清晰的文件名模式提取（如 agent_report_20251028）
     try:
-        # 尝试读取CSV前几行
-        df = pd.read_csv(csv_path, nrows=5, encoding='utf-8')
+        # 模式1: agent_report_20251028 格式
+        match = re.search(r'agent_report[_\s](\d{8})', filename)
+        if match:
+            date_str = match.group(1)
+            extracted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            print(f"[日期提取] ✓ 从文件名提取（代理报表格式）: {extracted_date}")
+            return extracted_date
         
-        # 常见的日期列名
-        date_columns = ['日期', 'date', 'Date', '统计日期', '报表日期', 'report_date']
+        # 模式2: ltv_20251028 格式
+        match = re.search(r'ltv[_\s](\d{8})', filename)
+        if match:
+            date_str = match.group(1)
+            extracted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            print(f"[日期提取] ✓ 从文件名提取（LTV格式）: {extracted_date}")
+            return extracted_date
         
-        for col in date_columns:
-            if col in df.columns:
-                date_val = str(df[col].iloc[0])
-                # 尝试解析日期
-                match = re.search(r'(\d{4}-\d{2}-\d{2})', date_val)
-                if match:
-                    return match.group(1)
+        # 模式3: retention_xxxx_2025-10-28 格式
+        match = re.search(r'retention.*?(\d{4}-\d{2}-\d{2})', filename)
+        if match:
+            extracted_date = match.group(1)
+            print(f"[日期提取] ✓ 从文件名提取（留存格式）: {extracted_date}")
+            return extracted_date
         
-        # 如果没找到，尝试文件名中的日期
-        filename = os.path.basename(csv_path)
+        # 模式4: 通用日期格式 YYYY-MM-DD
         match = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
         if match:
-            return match.group(1)
-        
-        # 使用今天的日期作为备选
-        return date.today().isoformat()
-        
+            extracted_date = match.group(1)
+            print(f"[日期提取] ✓ 从文件名提取（通用格式）: {extracted_date}")
+            return extracted_date
+            
     except Exception as e:
-        print(f"[日期提取] 失败: {e}")
-        return date.today().isoformat()
+        print(f"[日期提取] ✗ 文件名提取失败: {e}")
+    
+    # ===== 方法3：使用昨天日期（最后备选） =====
+    from datetime import timedelta
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    print(f"[日期提取] ⚠ 使用默认日期（昨天）: {yesterday}")
+    return yesterday
 
 
 def rename_downloaded_file(src_path: str, site: Site) -> str:
@@ -1004,12 +1208,19 @@ def rename_downloaded_file(src_path: str, site: Site) -> str:
     
     new_path = os.path.join(os.path.dirname(src_path), new_name)
     
-    # 避免覆盖（添加序号）
-    i = 1
-    base = os.path.splitext(new_path)[0]
-    while os.path.exists(new_path):
-        new_path = f"{base}({i}).csv"
-        i += 1
+    # v2.3: 根据配置决定是否覆盖
+    if OVERWRITE_EXISTING_FILES:
+        # 覆盖模式：如果文件已存在，先删除
+        if os.path.exists(new_path):
+            os.remove(new_path)
+            print(f"[覆盖] 删除旧文件: {os.path.basename(new_path)}")
+    else:
+        # 避免覆盖：添加序号
+        i = 1
+        base = os.path.splitext(new_path)[0]
+        while os.path.exists(new_path):
+            new_path = f"{base}({i}).csv"
+            i += 1
     
     # 重命名
     shutil.move(src_path, new_path)
@@ -1020,7 +1231,7 @@ def rename_downloaded_file(src_path: str, site: Site) -> str:
 
 def rename_downloaded_file_v2(src_path: str, site: Site, task_key: str) -> str:
     """
-    v2.0: 根据任务类型重命名下载的文件
+    v2.4: 根据任务类型重命名下载的文件（修复代理报表日期提取）
     
     参数:
         src_path: 源文件路径
@@ -1028,12 +1239,38 @@ def rename_downloaded_file_v2(src_path: str, site: Site, task_key: str) -> str:
         task_key: 任务标识，如 "first_paid_ltv", "retention_login", "agent_report_2025-10-27"
     
     文件命名规则:
-        - LTV: 产品-平台-地区-部门-ltv-日期.csv
+        - LTV: 产品-平台-地区-部门-ltv-日期.csv（日期为最新日期-1天）
         - 留存: 产品-平台-地区-部门-[留存类型]-日期.csv（如"首充用户登录留存"）
-        - 代理报表: 产品-平台-地区-部门-代理报表-日期.csv
+        - 代理报表: 产品-平台-地区-部门-代理报表-日期.csv（日期从task_key提取）
     """
-    # 从CSV内容提取日期
-    file_date = extract_date_from_csv(src_path)
+    # v2.4: 代理报表特殊处理 - 从task_key提取日期（不从CSV）
+    if task_key.startswith("agent_report_"):
+        # 从task_key提取日期，如 "agent_report_2025-10-01"
+        date_match = re.search(r'agent_report_(\d{4}-\d{2}-\d{2})', task_key)
+        if date_match:
+            file_date = date_match.group(1)
+            print(f"[日期提取] 代理报表使用任务日期: {file_date}")
+        else:
+            # 备选：从CSV提取
+            file_date = extract_date_from_csv(src_path)
+            print(f"[日期提取] 代理报表从CSV提取: {file_date}")
+    else:
+        # LTV和留存：从CSV内容提取最新日期
+        file_date = extract_date_from_csv(src_path)
+    
+    # v2.3: LTV文件特殊规则 - 使用最新日期的前一天
+    if task_key == "first_paid_ltv":
+        from datetime import datetime, timedelta
+        try:
+            # 将日期字符串转换为日期对象
+            date_obj = datetime.strptime(file_date, "%Y-%m-%d")
+            # 减去1天
+            date_obj = date_obj - timedelta(days=1)
+            # 转换回字符串
+            file_date = date_obj.strftime("%Y-%m-%d")
+            print(f"[日期调整] LTV文件使用最新日期-1天: {file_date}")
+        except Exception as e:
+            print(f"[日期调整] ✗ LTV日期调整失败: {e}，使用原日期")
     
     # 根据任务类型构建文件名
     if task_key == "first_paid_ltv":
@@ -1061,12 +1298,27 @@ def rename_downloaded_file_v2(src_path: str, site: Site, task_key: str) -> str:
     new_name = sanitize_filename(new_name)
     new_path = os.path.join(os.path.dirname(src_path), new_name)
     
-    # 避免覆盖（添加序号）
-    i = 1
-    base = os.path.splitext(new_path)[0]
-    while os.path.exists(new_path):
-        new_path = f"{base}({i}).csv"
-        i += 1
+    # v2.4.2: 根据任务类型决定是否覆盖
+    # LTV和留存：强制覆盖（因为每次都是最新的完整数据）
+    # 代理报表：遵循全局配置（因为按日期区分）
+    if task_key == "first_paid_ltv" or task_key.startswith("retention_"):
+        # LTV和留存：强制覆盖，确保只有1个LTV + 3个留存文件
+        if os.path.exists(new_path):
+            os.remove(new_path)
+            print(f"[覆盖] LTV/留存：删除旧文件 {os.path.basename(new_path)}")
+    elif OVERWRITE_EXISTING_FILES:
+        # 代理报表：遵循全局配置 - 覆盖模式
+        if os.path.exists(new_path):
+            os.remove(new_path)
+            print(f"[覆盖] 代理报表：删除旧文件 {os.path.basename(new_path)}")
+    else:
+        # 代理报表：遵循全局配置 - 保留模式（添加序号）
+        i = 1
+        base = os.path.splitext(new_path)[0]
+        while os.path.exists(new_path):
+            new_path = f"{base}({i}).csv"
+            i += 1
+        print(f"[保留] 代理报表：添加序号避免覆盖")
     
     # 重命名
     shutil.move(src_path, new_path)
@@ -1076,32 +1328,27 @@ def rename_downloaded_file_v2(src_path: str, site: Site, task_key: str) -> str:
 
 
 # ========== 主流程 ==========
-def export_all_sites(site: Site, mode: str = "current", target_date: str = None):
+def export_all_sites(site: Site, mode: str = "current", history_dates: list = None):
     """
-    第一阶段：导出站点数据（v2.2版本 - 支持双模式）
+    第一阶段：导出站点数据（v2.3版本 - 优化历史模式）
     
     参数:
         site: 站点信息
         mode: 模式选择
-            - "current": 当前模式，导出LTV+留存+代理报表（共5个文件）
-            - "history": 历史模式，只导出代理报表（1个文件）
-        target_date: 目标日期（格式：YYYY-MM-DD）
-            - mode="current"时：使用昨天日期（忽略此参数）
-            - mode="history"时：使用指定日期
+            - "current": 当前模式，导出LTV+留存+昨天代理报表（共5个文件）
+            - "history": 历史模式，导出历史代理报表+LTV+留存（历史天数+4个文件）
+        history_dates: 历史日期列表（仅history模式使用，包含昨天）
     
     返回: 成功导出的总数量
     """
+    print(f"\n{'='*80}")
     if mode == "history":
-        print(f"\n{'='*80}")
-        print(f"[历史模式] 站点: {site.platform} | 日期: {target_date}")
-        print(f"账号: {site.username} | 地区: {site.region} | 部门: {site.dept}")
-        print(f"{'='*80}\n")
+        print(f"[历史模式] 站点: {site.platform}")
+        print(f"日期范围: {history_dates[0]} 至 {history_dates[-1]} (共{len(history_dates)}天)")
     else:
-        print(f"\n{'='*80}")
-        print(f"[导出阶段] {site.product}-{site.platform}-{site.region}-{site.dept}")
-        print(f"URL: {site.url}")
-        print(f"账号: {site.username}")
-        print(f"{'='*80}\n")
+        print(f"[当前模式] 站点: {site.platform}")
+    print(f"账号: {site.username} | 地区: {site.region} | 部门: {site.dept}")
+    print(f"{'='*80}\n")
     
     # 设置下载目录（虽然这阶段不下载，但setup_driver需要）
     download_dir = os.path.join(DOWNLOADS_ROOT, site.platform)
@@ -1116,26 +1363,73 @@ def export_all_sites(site: Site, mode: str = "current", target_date: str = None)
         
         export_count = 0
         
-        # 根据模式决定导出内容
         if mode == "history":
-            # ===== 历史模式：只导出代理报表 =====
+            # ===== 历史模式优化流程 =====
+            
+            # 步骤1: 导出所有历史日期的代理报表（包括昨天）
             print(f"\n{'='*60}")
-            print(f"历史模式: 导出 {target_date} 的代理报表")
+            print(f"步骤1/3: 导出代理报表 (共{len(history_dates)}天)")
             print(f"{'='*60}")
             try:
                 navigate_to_agent_reports(driver)
-                if click_export_for_date(driver, target_date):
-                    export_count += 1
-                    print(f"[✓] {target_date}")
-                else:
-                    print(f"[✗] {target_date} 导出失败")
+                
+                # v2.4: 先识别页面上可用的日期
+                available_dates = get_available_dates_from_page(driver)
+                print(f"[识别] 页面上可用的日期数: {len(available_dates)}")
+                
+                # 筛选出我们需要的且存在的日期
+                dates_to_export = [d for d in history_dates if d in available_dates]
+                skipped_dates = [d for d in history_dates if d not in available_dates]
+                
+                print(f"[导出] 将导出 {len(dates_to_export)}/{len(history_dates)} 个日期")
+                if skipped_dates:
+                    print(f"[跳过] {len(skipped_dates)} 个不存在的日期: {', '.join(skipped_dates[:5])}{'...' if len(skipped_dates) > 5 else ''}")
+                
+                # 只导出存在的日期
+                for day in dates_to_export:
+                    if click_export_for_date(driver, day):
+                        export_count += 1
+                        print(f"[✓] {day}")
+                    else:
+                        print(f"[✗] {day} 导出失败")
+                    time.sleep(1)
             except Exception as e:
                 print(f"[✗] 代理报表异常: {e}")
+            
+            time.sleep(2)
+            
+            # 步骤2: 导出首充用户LTV
+            print(f"\n{'='*60}")
+            print("步骤2/3: 导出首充用户LTV")
+            print(f"{'='*60}")
+            try:
+                navigate_to_first_paid_ltv(driver)
+                if export_first_paid_ltv(driver):
+                    export_count += 1
+                    print("[✓] 首充用户LTV导出成功")
+                else:
+                    print("[✗] 首充用户LTV导出失败")
+            except Exception as e:
+                print(f"[✗] 首充用户LTV异常: {e}")
+            
+            time.sleep(2)
+            
+            # 步骤3: 导出用户留存（3个）
+            print(f"\n{'='*60}")
+            print("步骤3/3: 导出用户留存 (3个类型)")
+            print(f"{'='*60}")
+            try:
+                navigate_to_user_retention(driver)
+                retention_count = export_all_user_retentions(driver)
+                export_count += retention_count
+                print(f"[✓] 用户留存导出: {retention_count}/3 成功")
+            except Exception as e:
+                print(f"[✗] 用户留存异常: {e}")
         
         else:  # mode == "current"
             # ===== 当前模式：导出5个文件（原有逻辑） =====
             
-            # ===== 步骤1: 导出首充用户LTV =====
+            # 步骤1: 导出首充用户LTV
             print(f"\n{'='*60}")
             print("步骤1/3: 导出首充用户LTV")
             print(f"{'='*60}")
@@ -1151,7 +1445,7 @@ def export_all_sites(site: Site, mode: str = "current", target_date: str = None)
             
             time.sleep(2)
             
-            # ===== 步骤2: 导出用户留存（3个） =====
+            # 步骤2: 导出用户留存（3个）
             print(f"\n{'='*60}")
             print("步骤2/3: 导出用户留存 (3个类型)")
             print(f"{'='*60}")
@@ -1165,7 +1459,7 @@ def export_all_sites(site: Site, mode: str = "current", target_date: str = None)
             
             time.sleep(2)
             
-            # ===== 步骤3: 导出代理报表（昨天数据） =====
+            # 步骤3: 导出代理报表（昨天数据）
             print(f"\n{'='*60}")
             print("步骤3/3: 导出代理报表（昨天数据）")
             print(f"{'='*60}")
@@ -1222,14 +1516,128 @@ def check_and_download_site(site: Site, expected_tasks: list) -> tuple[int, list
         # 进入下载列表
         navigate_to_download_list(driver)
         
+        # ===== v2.4.1 新增：调整页面显示条数为500（关键修复） =====
+        try:
+            print(f"[下载-调试] 尝试调整页面显示条数为500条/页...")
+            
+            # 多策略查找select元素
+            size_select = None
+            try:
+                size_select = driver.find_element(By.ID, 'size')
+                print(f"[下载-调试] ✓ 通过ID找到select元素")
+            except:
+                try:
+                    size_select = driver.find_element(By.NAME, 'size')
+                    print(f"[下载-调试] ✓ 通过name找到select元素")
+                except:
+                    try:
+                        size_select = driver.find_element(By.CSS_SELECTOR, 'select.select-xs')
+                        print(f"[下载-调试] ✓ 通过class找到select元素")
+                    except:
+                        print(f"[下载-调试] ✗ 所有策略都失败")
+            
+            if size_select:
+                current_value = size_select.get_attribute('value')
+                print(f"[下载-调试] 当前显示条数: {current_value}条/页")
+                
+                if current_value != '500':
+                    select = Select(size_select)
+                    select.select_by_value('500')
+                    print(f"[下载] 已调整为500条/页，等待页面刷新...")
+                    time.sleep(3)
+                else:
+                    print(f"[下载-调试] 已经是500条/页，无需调整")
+            else:
+                print(f"[下载-警告] ⚠ 未找到页面显示条数选择器")
+        except Exception as e:
+            print(f"[下载-警告] ⚠ 调整显示条数失败: {e}")
+        
+        # ===== 新增：页面诊断信息 =====
+        print(f"\n[页面诊断] 开始分析页面结构...")
+        print(f"  当前URL: {driver.current_url}")
+        print(f"  页面标题: {driver.title}")
+        
+        # 查找包含关键字的元素
+        print(f"\n[页面诊断] 查找包含关键字的元素：")
+        keywords = ["任务", "导出", "下载", "backend", "task", "export"]
+        for keyword in keywords:
+            try:
+                # 查找包含关键字的任意元素
+                elements = driver.find_elements(By.XPATH, f"//*[contains(text(),'{keyword}')]")
+                if elements:
+                    print(f"  找到 {len(elements)} 个包含'{keyword}'的元素")
+                    # 打印前3个元素的文本和标签
+                    for i, elem in enumerate(elements[:3], 1):
+                        try:
+                            tag = elem.tag_name
+                            text = elem.text[:100] if elem.text else "(无文本)"
+                            print(f"    {i}. <{tag}>: {text}")
+                        except:
+                            pass
+            except Exception as e:
+                pass
+        
+        # 尝试多种选择器查找任务列表
+        print(f"\n[页面诊断] 尝试多种选择器：")
+        selectors = [
+            ("表格行 //tr", '//tr'),
+            ("表格 //table", '//table'),
+            ("列表项 //li", '//li'),
+            ("卡片 div.card", 'div.card'),
+            ("行容器 div.row", 'div.row'),
+            ("任务容器 [class*='task']", "//*[contains(@class,'task')]"),
+            ("后台任务 [class*='backend']", "//*[contains(@class,'backend')]"),
+        ]
+        
+        for name, selector in selectors:
+            try:
+                if selector.startswith('//') or selector.startswith('/'):
+                    elements = driver.find_elements(By.XPATH, selector)
+                else:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    print(f"  {name}: 找到 {len(elements)} 个元素")
+            except Exception as e:
+                print(f"  {name}: 查找失败 - {e}")
+        
+        print(f"{'='*80}\n")
+        
         # 获取页面上所有任务行
         time.sleep(2)
         all_rows = driver.find_elements(By.XPATH, '//tr')
+        print(f"[下载-调试] 获取到 {len(all_rows)} 个表格行（包含表头）")
         
-        # 智能匹配任务（v2.1 改进版：支持留存任务批量匹配）
+        # ===== 新增：详细打印前15行的文本内容 =====
+        print(f"\n[下载-学习] 开始打印任务行内容（用于学习后台任务名称）：")
+        print(f"{'='*80}")
+        for i, row in enumerate(all_rows[:15], 1):  # 只打印前15行
+            try:
+                row_text = row.text.strip()
+                if row_text:
+                    # 检查是否包含关键元素
+                    has_download_btn = len(row.find_elements(By.XPATH, './/a[contains(@href,"download")]')) > 0
+                    has_badge = len(row.find_elements(By.XPATH, './/*[contains(@class,"badge")]')) > 0
+                    
+                    print(f"行 {i}:")
+                    print(f"  文本: {row_text[:200]}")  # 限制长度避免过长
+                    print(f"  有下载按钮: {has_download_btn}")
+                    print(f"  有状态标记: {has_badge}")
+                    
+                    # 尝试查找具体的链接
+                    links = row.find_elements(By.XPATH, './/a[@href]')
+                    if links:
+                        hrefs = [link.get_attribute('href') for link in links[:3]]  # 最多3个
+                        print(f"  链接: {hrefs}")
+                    print()
+            except Exception as e:
+                print(f"行 {i}: 读取失败 - {e}")
+        print(f"{'='*80}\n")
+        
+        # 智能匹配任务（v2.4 改进版：支持留存和代理报表批量匹配）
         completed_tasks = []
         task_row_map = {}  # {task_key: row_element}
         retention_rows = []  # 存储所有已完成的留存任务行
+        agent_report_rows = []  # 存储所有已完成的代理报表任务行（日期 -> row）
         
         # 第一步：收集所有留存任务（因为后台不区分具体类型）
         retention_task_keys = [k for k in expected_tasks if k.startswith("retention_")]
@@ -1247,7 +1655,31 @@ def check_and_download_site(site: Site, expected_tasks: list) -> tuple[int, list
                     pass
             print(f"[下载-调试] 找到 {len(retention_rows)} 个已完成的用户留存任务")
         
-        # 第二步：按导出顺序将留存任务分配给对应的task_key
+        # 第二步：收集所有代理报表任务（v2.4.1增强：区分总数和已完成数）
+        agent_report_task_keys = [k for k in expected_tasks if k.startswith("agent_report_")]
+        if agent_report_task_keys:
+            pattern = TASK_PATTERNS["agent_report"]
+            all_agent_reports = []  # 所有代理报表任务（包括未完成的）
+            
+            for row in all_rows:
+                try:
+                    row_text = row.text
+                    if re.search(pattern, row_text):
+                        all_agent_reports.append(row)
+                        # 检查是否已完成
+                        done_badges = row.find_elements(By.XPATH, TASK_DONE_XPATH)
+                        if done_badges:
+                            # 从行文本中提取日期
+                            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', row_text)
+                            if date_match:
+                                date_str = date_match.group(1)
+                                agent_report_rows.append((date_str, row))
+                except Exception:
+                    pass
+            
+            print(f"[下载-调试] 代理报表：找到 {len(all_agent_reports)} 个任务，其中 {len(agent_report_rows)} 个已完成")
+        
+        # 第三步：按导出顺序将留存任务分配给对应的task_key
         # 导出顺序：retention_login -> retention_play -> retention_pay
         retention_order = ["retention_login", "retention_play", "retention_pay"]
         for idx, task_key in enumerate(retention_order):
@@ -1256,20 +1688,30 @@ def check_and_download_site(site: Site, expected_tasks: list) -> tuple[int, list
                 task_row_map[task_key] = retention_rows[idx]
                 print(f"[下载-调试] {task_key} 匹配到第 {idx+1} 个留存任务")
         
-        # 第三步：匹配其他任务（LTV、代理报表）
-        for task_key in expected_tasks:
-            if task_key.startswith("retention_"):
-                continue  # 留存任务已处理，跳过
-            
-            # 确定任务类型和匹配模式
-            if task_key == "first_paid_ltv":
-                pattern = TASK_PATTERNS["first_paid_ltv"]
-            elif task_key.startswith("agent_report_"):
-                pattern = TASK_PATTERNS["agent_report"]
-            else:
-                continue
-            
-            # 在所有行中查找匹配的任务
+        # 第四步：根据日期将代理报表任务分配给对应的task_key（v2.4.1优先最新）
+        for task_key in agent_report_task_keys:
+            if task_key in expected_tasks:
+                # 从 task_key 提取日期，如 "agent_report_2025-10-01"
+                date_match = re.search(r'agent_report_(\d{4}-\d{2}-\d{2})', task_key)
+                if date_match:
+                    target_date = date_match.group(1)
+                    # 收集所有匹配该日期的任务
+                    matching_rows = [row for date_str, row in agent_report_rows if date_str == target_date]
+                    
+                    if matching_rows:
+                        # 优先使用最后一个（通常是最新的）
+                        selected_row = matching_rows[-1]
+                        completed_tasks.append(task_key)
+                        task_row_map[task_key] = selected_row
+                        
+                        if len(matching_rows) > 1:
+                            print(f"[下载-调试] {task_key} 找到 {len(matching_rows)} 个任务，使用最新的")
+                        else:
+                            print(f"[下载-调试] {task_key} 匹配成功（日期: {target_date}）")
+        
+        # 第五步：匹配LTV任务
+        if "first_paid_ltv" in expected_tasks:
+            pattern = TASK_PATTERNS["first_paid_ltv"]
             for row in all_rows:
                 try:
                     row_text = row.text
@@ -1277,16 +1719,72 @@ def check_and_download_site(site: Site, expected_tasks: list) -> tuple[int, list
                         # 检查是否已完成
                         done_badges = row.find_elements(By.XPATH, TASK_DONE_XPATH)
                         if done_badges:
-                            completed_tasks.append(task_key)
-                            task_row_map[task_key] = row
-                            print(f"[下载-调试] {task_key} 匹配成功")
+                            completed_tasks.append("first_paid_ltv")
+                            task_row_map["first_paid_ltv"] = row
+                            print(f"[下载-调试] first_paid_ltv 匹配成功")
                         break
                 except Exception:
                     pass
         
+        # ===== 新增：统计未匹配的已完成任务 =====
+        print(f"\n[下载-统计] 匹配结果：")
+        print(f"  期望任务数: {len(expected_tasks)}")
+        print(f"  已匹配任务数: {len(completed_tasks)}")
+        print(f"  未匹配任务: {[t for t in expected_tasks if t not in completed_tasks]}")
+        
+        if len(completed_tasks) < len(expected_tasks):
+            print(f"\n[下载-分析] 可能的原因：")
+            print(f"  1. 任务还在处理中（未生成完成）")
+            print(f"  2. 任务名称与匹配规则不符")
+            print(f"  3. 页面结构与预期不同")
+            print(f"\n[下载-建议] 请查看上方的任务行内容，确认后台实际显示的任务名称")
+            
+            # ===== 新增：兜底下载策略（广泛规则） =====
+            print(f"\n[兜底策略] 启动广泛规则下载...")
+            print(f"[兜底策略] 查找页面上所有'下载'链接...")
+            
+            # 查找所有包含download的链接
+            download_links = driver.find_elements(By.XPATH, '//a[contains(@href,"download")]')
+            print(f"[兜底策略] 找到 {len(download_links)} 个下载链接")
+            
+            if download_links:
+                # 计算还需要下载几个文件
+                remaining_tasks = len(expected_tasks) - len(completed_tasks)
+                print(f"[兜底策略] 还需下载 {remaining_tasks} 个文件")
+                
+                # 最多下载remaining_tasks个文件（避免下载过多）
+                for i, link in enumerate(download_links[:remaining_tasks], 1):
+                    try:
+                        link_text = link.text[:50] if link.text else "(无文本)"
+                        link_href = link.get_attribute('href')
+                        print(f"[兜底策略] 点击第 {i} 个下载链接: {link_text}")
+                        print(f"  链接: {link_href[:100]}")
+                        
+                        before = set(os.listdir(download_dir))
+                        link.click()
+                        time.sleep(2)
+                        
+                        file_path = wait_for_new_download(download_dir, before, timeout=DOWNLOAD_WAIT)
+                        if file_path:
+                            # 使用通用命名方式（报表生成器会用内容分类）
+                            # 暂时不重命名，先下载下来
+                            print(f"  ✓ 下载成功: {os.path.basename(file_path)}")
+                            completed_tasks.append(f"fallback_{i}")
+                        else:
+                            print(f"  ✗ 下载超时")
+                    except Exception as e:
+                        print(f"  ✗ 下载失败: {e}")
+                        
+                print(f"[兜底策略] 完成，共下载 {len([t for t in completed_tasks if t.startswith('fallback_')])} 个文件")
+        
         # 下载已完成的文件
         success_count = 0
         for task_key in completed_tasks:
+            # 跳过兜底策略下载的任务（已经下载完成）
+            if task_key.startswith("fallback_"):
+                success_count += 1
+                continue
+                
             try:
                 row = task_row_map[task_key]
                 download_btns = row.find_elements(By.XPATH, TASK_DOWNLOAD_XPATH)
@@ -1350,7 +1848,7 @@ def cleanup_chrome_processes():
 def main():
     """主函数"""
     print("="*80)
-    print("代理日报表自动下载爬虫 v2.2")
+    print("代理日报表自动下载爬虫 v2.4.2")
     print("="*80)
     
     # 清理可能残留的Chrome进程
@@ -1390,189 +1888,201 @@ def main():
     
     try:
         # ========== 第一轮：批量导出所有网站 ==========
-        print("\n" + "="*80)
-        print("第一轮：批量导出所有网站")
-        print("="*80)
+        if RUN_MODE in ["full", "export_only"]:
+            print("\n" + "="*80)
+            print("第一轮：批量导出所有网站")
+            print("="*80)
+        else:
+            print("\n" + "="*80)
+            print("跳过导出阶段（RUN_MODE=download_only）")
+            print("="*80)
         
         export_results = {}
         history_export_results = {}
         
-        # v2.2: 如果启用历史模式，先爬历史数据
-        if ENABLE_HISTORY_MODE:
-            print("\n" + "="*60)
-            print("历史数据补齐模式（只爬代理报表）")
-            print(f"日期范围: {HISTORY_START_DATE} 至 {HISTORY_END_DATE}")
-            print("="*60)
-            
-            # 生成日期列表
-            from datetime import datetime
-            start = datetime.strptime(HISTORY_START_DATE, "%Y-%m-%d")
-            end = datetime.strptime(HISTORY_END_DATE, "%Y-%m-%d")
-            history_dates = []
-            current = start
-            while current <= end:
-                history_dates.append(current.strftime("%Y-%m-%d"))
-                current += timedelta(days=1)
-            
-            print(f"需要爬取 {len(history_dates)} 天的历史数据")
-            
-            # 遍历所有日期和站点
-            for date_str in history_dates:
-                print(f"\n{'='*60}")
-                print(f"历史日期: {date_str}")
-                print(f"{'='*60}")
+        # v2.4: 根据运行模式决定是否执行导出
+        if RUN_MODE in ["full", "export_only"]:
+            # v2.3: 优化的历史模式或当前模式
+            if ENABLE_HISTORY_MODE:
+                # ===== 历史模式：统一导出，延后下载 =====
+                print("\n" + "="*60)
+                print("历史数据补齐模式（优化版）")
+                print(f"日期范围: {HISTORY_START_DATE} 至 {HISTORY_END_DATE}")
+                print("="*60)
                 
+                # 生成日期列表（包含昨天）
+                from datetime import datetime
+                start = datetime.strptime(HISTORY_START_DATE, "%Y-%m-%d")
+                end = datetime.strptime(HISTORY_END_DATE, "%Y-%m-%d")
+                yesterday = date_list(LAST_N_DAYS)[0]  # 获取昨天日期
+                
+                history_dates = []
+                current = start
+                while current <= end:
+                    history_dates.append(current.strftime("%Y-%m-%d"))
+                    current += timedelta(days=1)
+                
+                # 将昨天添加到历史日期列表（如果还没有）
+                if yesterday not in history_dates:
+                    history_dates.append(yesterday)
+                
+                print(f"需要导出 {len(history_dates)} 天的代理报表 + LTV + 留存")
+                print(f"日期列表: {history_dates[0]} ~ {history_dates[-1]}")
+                
+                # 遍历所有站点，每个站点导出全部任务
                 for i, site in enumerate(sites, 1):
-                    print(f"\n[历史导出] {i}/{len(sites)} - {site.platform} - {date_str}")
-                    count = export_all_sites(site, mode="history", target_date=date_str)
-                    key = f"{site.platform}_{date_str}"
-                    history_export_results[key] = count
+                    print(f"\n[导出进度] {i}/{len(sites)} - {site.platform}")
+                    count = export_all_sites(site, mode="history", history_dates=history_dates)
+                    export_results[site.platform] = count
                     
                     if i < len(sites):
-                        time.sleep(2)
+                        time.sleep(3)
                 
-                time.sleep(3)  # 每个日期之间稍作停顿
+                print("\n" + "="*60)
+                print("历史模式导出完成！")
+                print(f"成功站点: {sum(1 for c in export_results.values() if c > 0)}/{len(sites)}")
+                print("="*60)
             
-            print("\n" + "="*60)
-            print("历史数据导出完成！")
-            print(f"成功: {sum(1 for c in history_export_results.values() if c > 0)}/{len(history_dates) * len(sites)}")
-            print("="*60)
-            
-            # 立即下载历史数据
-            print("\n" + "="*60)
-            print("开始下载历史数据...")
-            print("="*60)
-            time.sleep(5)  # 等待任务开始处理
-            
-            history_download_results = {}
-            for date_str in history_dates:
-                print(f"\n[历史下载] 日期: {date_str}")
+            else:
+                # ===== 当前模式：只爬昨天的数据 =====
+                print("\n" + "="*60)
+                print("当前模式：爬取昨天的全部数据（LTV + 留存 + 代理报表）")
+                print("="*60)
                 
-                # 为每个日期构建期望任务
-                history_expected_tasks = [f"agent_report_{date_str}"]
-                
-                # 下载该日期的所有站点数据
-                for site in sites:
-                    try:
-                        downloaded_count, still_pending = check_and_download_site(site, history_expected_tasks)
-                        if downloaded_count > 0:
-                            print(f"[✓] {site.platform}: 下载 {downloaded_count} 个文件")
-                            key = f"{site.platform}_{date_str}"
-                            history_download_results[key] = downloaded_count
-                        elif still_pending:
-                            print(f"[⚠] {site.platform}: {len(still_pending)} 个任务未完成")
-                    except Exception as e:
-                        print(f"[✗] {site.platform} 下载失败: {e}")
+                for i, site in enumerate(sites, 1):
+                    print(f"\n[导出进度] {i}/{len(sites)}")
+                    count = export_all_sites(site, mode="current")
+                    export_results[site.platform] = count
                     
-                    time.sleep(1)
+                    if i < len(sites):
+                        time.sleep(3)
+            
+            print("\n" + "="*80)
+            print("第一轮完成！所有导出任务已提交")
+            print(f"成功站点: {sum(1 for c in export_results.values() if c > 0)}/{len(sites)}")
+            print("="*80)
+        
+        # 等待一段时间后进入下载阶段
+        if RUN_MODE in ["full", "download_only"]:
+            if RUN_MODE == "full":
+                print("\n等待服务器处理导出任务...")
+                print("建议等待时间：代理报表生成较慢，给服务器充足时间")
+                time.sleep(10)  # 增加等待时间，让服务器开始处理任务
+            
+            # ========== 第二轮：批量下载所有网站（轮询模式 v2.4） ==========
+            print("\n" + "="*80)
+            print("第二轮：批量下载所有网站（轮询模式 v2.4）")
+            print("="*80)
+        else:
+            print("\n" + "="*80)
+            print("跳过下载阶段（RUN_MODE=export_only）")
+            print("="*80)
+        
+        # v2.4: 只在需要下载时执行下载逻辑
+        if RUN_MODE in ["full", "download_only"]:
+            # v2.4: 如果是download_only模式且需要history_dates，需要重新生成
+            if RUN_MODE == "download_only" and ENABLE_HISTORY_MODE:
+                from datetime import datetime
+                start = datetime.strptime(HISTORY_START_DATE, "%Y-%m-%d")
+                end = datetime.strptime(HISTORY_END_DATE, "%Y-%m-%d")
+                yesterday = date_list(LAST_N_DAYS)[0]
                 
-                time.sleep(2)  # 每个日期之间稍作停顿
-            
-            print("\n" + "="*60)
-            print("历史数据下载完成！")
-            print(f"成功下载: {sum(history_download_results.values())} 个文件")
-            print("="*60)
-        
-        # 当前模式：爬昨天的全部数据（5个文件）
-        print("\n" + "="*60)
-        print("当前模式：爬取昨天的全部数据（LTV + 留存 + 代理报表）")
-        print("="*60)
-        
-        for i, site in enumerate(sites, 1):
-            print(f"\n[当前导出] {i}/{len(sites)}")
-            count = export_all_sites(site, mode="current")
-            export_results[site.platform] = count
-            
-            if i < len(sites):
-                time.sleep(3)
-        
-        print("\n" + "="*80)
-        print("第一轮完成！所有导出任务已提交")
-        print(f"成功站点: {sum(1 for c in export_results.values() if c > 0)}/{len(sites)}")
-        print("="*80)
-        
-        # 直接进入下载阶段（不等待）
-        print("\n立即开始下载阶段...")
-        print("注意：如果任务还未完成，下载阶段会自动等待")
-        time.sleep(2)
-        
-        # ========== 第二轮：批量下载所有网站（轮询模式 v2.2） ==========
-        print("\n" + "="*80)
-        print("第二轮：批量下载所有网站（轮询模式 v2.2）")
-        print("="*80)
-        
-        # v2.2: 构建期望任务列表（根据模式动态调整）
-        yesterday = date_list(LAST_N_DAYS)[0]  # 获取昨天的日期
-        expected_tasks = [
-            "first_paid_ltv",           # 首充用户LTV
-            "retention_login",          # 首充用户登录留存
-            "retention_play",           # 首充用户下注留存
-            "retention_pay",            # 首充用户付费留存
-            f"agent_report_{yesterday}" # 代理报表
-        ]
-        
-        download_results = {}
-        
-        # 记录每个站点还未完成的任务
-        pending_sites = {i: {'site': site, 'pending_tasks': expected_tasks.copy()} 
-                        for i, site in enumerate(sites)}
-        
-        # v2.0: 使用全局配置参数
-        for round_num in range(1, MAX_ROUNDS + 1):
-            if not pending_sites:
-                print("\n✓ 所有站点都已完成！")
-                break
-            
-            print(f"\n{'='*60}")
-            print(f"第 {round_num} 轮检查（剩余 {len(pending_sites)} 个站点）")
-            print(f"{'='*60}")
-            
-            completed_in_round = []
-            
-            for site_id, info in list(pending_sites.items()):
-                site = info['site']
-                pending_tasks = info['pending_tasks']
+                history_dates = []
+                current = start
+                while current <= end:
+                    history_dates.append(current.strftime("%Y-%m-%d"))
+                    current += timedelta(days=1)
                 
-                print(f"\n[检查] {site.platform} (剩余 {len(pending_tasks)} 个任务)")
-                
-                # 检查并下载该站点
-                downloaded_count, still_pending = check_and_download_site(site, pending_tasks)
-                
-                if downloaded_count > 0:
-                    print(f"[下载] {site.platform}: 本轮下载 {downloaded_count} 个文件")
-                    download_results[site.platform] = download_results.get(site.platform, 0) + downloaded_count
-                
-                # 更新待处理任务
-                if still_pending:
-                    pending_sites[site_id]['pending_tasks'] = still_pending
-                    print(f"[等待] {site.platform}: 还有 {len(still_pending)} 个任务未完成")
-                else:
-                    completed_in_round.append(site_id)
-                    print(f"[完成] {site.platform}: 全部文件已下载")
-                
-                time.sleep(2)  # 站点间短暂休息
+                if yesterday not in history_dates:
+                    history_dates.append(yesterday)
             
-            # 移除已完成的站点
-            for site_id in completed_in_round:
-                del pending_sites[site_id]
+            # v2.3: 根据模式动态构建期望任务列表
+            if ENABLE_HISTORY_MODE:
+                # 历史模式：包含所有历史日期的代理报表 + LTV + 留存
+                expected_tasks = []
+                for date_str in history_dates:
+                    expected_tasks.append(f"agent_report_{date_str}")
+                expected_tasks.extend([
+                    "first_paid_ltv",
+                    "retention_login",
+                    "retention_play",
+                    "retention_pay"
+                ])
+                print(f"期望任务数: {len(expected_tasks)} ({len(history_dates)}天代理报表 + LTV + 3个留存)")
+            else:
+                # 当前模式：LTV + 留存 + 昨天代理报表
+                yesterday = date_list(LAST_N_DAYS)[0]
+                expected_tasks = [
+                    "first_paid_ltv",
+                    "retention_login",
+                    "retention_play",
+                    "retention_pay",
+                    f"agent_report_{yesterday}"
+                ]
+                print(f"期望任务数: {len(expected_tasks)} (LTV + 3个留存 + 昨天代理报表)")
             
-            # 如果还有未完成的站点，等待后进入下一轮
-            if pending_sites and round_num < MAX_ROUNDS:
-                print(f"\n等待 {ROUND_INTERVAL} 秒后进入第 {round_num + 1} 轮...")
-                time.sleep(ROUND_INTERVAL)
-        
-        # 显示最终结果
-        if pending_sites:
-            print(f"\n⚠ 还有 {len(pending_sites)} 个站点未完全完成（已达最大轮询次数）")
-            for info in pending_sites.values():
-                print(f"  - {info['site'].platform}: 剩余 {len(info['pending_tasks'])} 个任务")
-        
-        print("\n" + "="*80)
-        print("🎉 所有站点处理完成！")
-        print(f"📁 下载文件保存在: {os.path.abspath(DOWNLOADS_ROOT)}")
-        print(f"📊 导出成功: {sum(1 for c in export_results.values() if c > 0)}/{len(sites)} 个站点")
-        print(f"📊 下载成功: {sum(1 for c in download_results.values() if c > 0)}/{len(sites)} 个站点")
-        print("="*80)
+            download_results = {}
+            
+            # 记录每个站点还未完成的任务
+            pending_sites = {i: {'site': site, 'pending_tasks': expected_tasks.copy()} 
+                            for i, site in enumerate(sites)}
+            
+            # v2.0: 使用全局配置参数
+            for round_num in range(1, MAX_ROUNDS + 1):
+                if not pending_sites:
+                    print("\n✓ 所有站点都已完成！")
+                    break
+                
+                print(f"\n{'='*60}")
+                print(f"第 {round_num} 轮检查（剩余 {len(pending_sites)} 个站点）")
+                print(f"{'='*60}")
+                
+                completed_in_round = []
+                
+                for site_id, info in list(pending_sites.items()):
+                    site = info['site']
+                    pending_tasks = info['pending_tasks']
+                    
+                    print(f"\n[检查] {site.platform} (剩余 {len(pending_tasks)} 个任务)")
+                    
+                    # 检查并下载该站点
+                    downloaded_count, still_pending = check_and_download_site(site, pending_tasks)
+                    
+                    if downloaded_count > 0:
+                        print(f"[下载] {site.platform}: 本轮下载 {downloaded_count} 个文件")
+                        download_results[site.platform] = download_results.get(site.platform, 0) + downloaded_count
+                    
+                    # 更新待处理任务
+                    if still_pending:
+                        pending_sites[site_id]['pending_tasks'] = still_pending
+                        print(f"[等待] {site.platform}: 还有 {len(still_pending)} 个任务未完成")
+                    else:
+                        completed_in_round.append(site_id)
+                        print(f"[完成] {site.platform}: 全部文件已下载")
+                    
+                    time.sleep(2)  # 站点间短暂休息
+                
+                # 移除已完成的站点
+                for site_id in completed_in_round:
+                    del pending_sites[site_id]
+                
+                # 如果还有未完成的站点，等待后进入下一轮
+                if pending_sites and round_num < MAX_ROUNDS:
+                    print(f"\n等待 {ROUND_INTERVAL} 秒后进入第 {round_num + 1} 轮...")
+                    time.sleep(ROUND_INTERVAL)
+            
+            # 显示最终结果
+            if pending_sites:
+                print(f"\n⚠ 还有 {len(pending_sites)} 个站点未完全完成（已达最大轮询次数）")
+                for info in pending_sites.values():
+                    print(f"  - {info['site'].platform}: 剩余 {len(info['pending_tasks'])} 个任务")
+            
+            print("\n" + "="*80)
+            print("🎉 所有站点处理完成！")
+            print(f"📁 下载文件保存在: {os.path.abspath(DOWNLOADS_ROOT)}")
+            print(f"📊 导出成功: {sum(1 for c in export_results.values() if c > 0)}/{len(sites)} 个站点")
+            print(f"📊 下载成功: {sum(1 for c in download_results.values() if c > 0)}/{len(sites)} 个站点")
+            print("="*80)
         
     except KeyboardInterrupt:
         print("\n\n用户中断程序")
